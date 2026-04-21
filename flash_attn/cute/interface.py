@@ -1184,6 +1184,7 @@ def _compile_bwd_preprocess(
     pack_gqa,
     qhead_per_kvhead,
     nheads_kv,
+    hdim_multiple_of,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1206,6 +1207,7 @@ def _compile_bwd_preprocess(
         pack_gqa=pack_gqa,
         qhead_per_kvhead=qhead_per_kvhead,
         nheads_kv=nheads_kv,
+        hdim_multiple_of=hdim_multiple_of,
     )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
@@ -1227,8 +1229,12 @@ def _bwd_preprocess(
     qhead_per_kvhead=1,  # only used with pack_gqa
     nheads_kv=1,         # only used with pack_gqa
     softmax_scale=1.0,   # only used with scale_p
+    hdim_multiple_of=32,
 ):
-    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
+    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
+
+    ``hdim_multiple_of`` must match the bwd kernel's ``tile_hdim`` alignment
+    so the zero-fill covers the full buffer."""
     if row_max is not None:
         assert scale_p is not None
     compile_key = (
@@ -1243,6 +1249,7 @@ def _bwd_preprocess(
         pack_gqa,
         qhead_per_kvhead,
         nheads_kv,
+        hdim_multiple_of,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -1260,7 +1267,7 @@ _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
 def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
     has_cuseqlens_q, has_seqused_q,
-    use_2cta_instrs, cluster_size, arch,
+    use_2cta_instrs, cluster_size, arch, hdim_multiple_of,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1274,6 +1281,7 @@ def _compile_bwd_postprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
+        hdim_multiple_of=hdim_multiple_of,
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
@@ -1287,13 +1295,15 @@ def _bwd_postprocess_convert(
     cu_seqlens, seqused,
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
-    use_2cta_instrs=False, cluster_size=1,
+    use_2cta_instrs=False, cluster_size=1, hdim_multiple_of=32,
 ):
-    """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
+    """Backward postprocess: convert float32 accumulator to bf16/fp16 output.
+
+    ``hdim_multiple_of`` must match the bwd kernel's ``tile_hdim`` alignment."""
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
         cu_seqlens is not None, seqused is not None,
-        use_2cta_instrs, cluster_size, arch,
+        use_2cta_instrs, cluster_size, arch, hdim_multiple_of,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
@@ -1585,7 +1595,11 @@ def _flash_attn_bwd(
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+    # Must match the bwd kernel's internal tile_hdim rounding. SM90 uses 16
+    # by default and 64 when dKV_swapAB=True (WGMMA M=64 alignment); other
+    # archs use 32. Allocation must be >= the kernel's stride or we OOB.
+    _bwd_hdim_mul = 64 if ((arch // 10 == 9) and dKV_swapAB) else 32
+    head_dim_rounded = (head_dim + _bwd_hdim_mul - 1) // _bwd_hdim_mul * _bwd_hdim_mul
 
     if cu_seqlens_q is None:
         dq_accum = (
@@ -1680,6 +1694,7 @@ def _flash_attn_bwd(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
+        hdim_multiple_of=_bwd_hdim_mul,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
@@ -2037,6 +2052,7 @@ def _flash_attn_bwd(
             arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
             AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+            hdim_multiple_of=_bwd_hdim_mul,
         )
 
         if dKV_postprocess:
@@ -2047,6 +2063,7 @@ def _flash_attn_bwd(
                 arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
+                hdim_multiple_of=_bwd_hdim_mul,
             )
             # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
             _bwd_postprocess_convert(
@@ -2055,6 +2072,7 @@ def _flash_attn_bwd(
                 arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
+                hdim_multiple_of=_bwd_hdim_mul,
             )
 
     return dq, dk, dv
