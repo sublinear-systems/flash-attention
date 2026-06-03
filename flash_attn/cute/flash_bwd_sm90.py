@@ -1890,22 +1890,40 @@ class FlashAttentionBackwardSm90:
                                 1,
                             )
                 else:
-                    assert not self.deterministic, (
-                        "Deterministic not implemented for block-sparse backward"
-                    )
-                    dQaccum_store_block_sparse_bwd_sm90(
-                        blocksparse_tensors,
-                        batch_idx,
-                        head_idx,
-                        n_block,
-                        sdQaccum,
-                        gdQaccum,
-                        subtile_factor=self.subtile_factor,
-                        m_block_max=m_block_max,
-                        num_dQ_warp_groups=self.num_wg_dQ,
-                        num_threads_per_warp_group=self.num_threads_per_warp_group,
-                        tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
-                    )
+                    if const_expr(self.deterministic):
+                        # Ordered by dq_write_order ranks (each n_block's position in the
+                        # target m_block's contributor list); no skip-signaling needed --
+                        # ranks only count actual contributors.
+                        dQaccum_store_block_sparse_bwd_sm90(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            sdQaccum,
+                            gdQaccum,
+                            subtile_factor=self.subtile_factor,
+                            m_block_max=m_block_max,
+                            num_dQ_warp_groups=self.num_wg_dQ,
+                            num_threads_per_warp_group=self.num_threads_per_warp_group,
+                            tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
+                            deterministic=True,
+                            mdQ_semaphore_cur=mdQ_semaphore_cur,
+                            warp_local_tidx=warp_local_tidx,
+                        )
+                    else:
+                        dQaccum_store_block_sparse_bwd_sm90(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            sdQaccum,
+                            gdQaccum,
+                            subtile_factor=self.subtile_factor,
+                            m_block_max=m_block_max,
+                            num_dQ_warp_groups=self.num_wg_dQ,
+                            num_threads_per_warp_group=self.num_threads_per_warp_group,
+                            tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
+                        )
 
             # For local masking + deterministic (non-spt): signal remaining m_blocks
             # that this n_block won't visit, so they don't deadlock waiting.

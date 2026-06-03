@@ -15,6 +15,7 @@ from cutlass import Float32, Int32, const_expr
 from quack import copy_utils
 
 # Import data structures from block_sparsity
+from flash_attn.cute import barrier
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -1459,13 +1460,30 @@ def _store_one_dQaccum_sm90(
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
+    deterministic: cutlass.Constexpr = False,
+    mdQ_semaphore_cur: Optional[cute.Tensor] = None,
+    warp_local_tidx=None,
+    lock_value=None,
 ):
-    """Store dQaccum for a single m_block."""
+    """Store dQaccum for a single m_block. With ``deterministic``, the accumulate is
+    semaphore-ordered (mirroring the dense deterministic path): wait until this n_block's
+    turn for the target m_block (``lock_value`` = the n_block's rank among the m_block's
+    contributors, see compute_dq_write_order), drain the bulk-add, then release."""
     for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
-        cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
+        if const_expr(not deterministic):
+            # If deterministic, we already waited (group 0 drain) at the end of the prev store
+            cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
         cute.arch.barrier_arrive(
             barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
+        )
+    if const_expr(deterministic):
+        # Semaphore acquire: wait for prior contributors to finish writing this m_block
+        barrier.wait_eq(
+            mdQ_semaphore_cur[(m_block, None)].iterator,
+            warp_local_tidx,
+            0,  # flag_offset
+            lock_value,
         )
     for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
         cute.arch.barrier(
@@ -1479,6 +1497,15 @@ def _store_one_dQaccum_sm90(
                 tma_copy_bytes_dQ,
             )
         cute.arch.cp_async_bulk_commit_group()
+    if const_expr(deterministic):
+        # Semaphore release: drain our bulk-add, then signal the next contributor
+        cute.arch.cp_async_bulk_wait_group(0, read=False)
+        barrier.arrive_inc(
+            mdQ_semaphore_cur[(m_block, None)].iterator,
+            warp_local_tidx,
+            0,  # flag_offset
+            1,
+        )
 
 
 @cute.jit
@@ -1494,10 +1521,16 @@ def dQaccum_store_block_sparse_bwd_sm90(
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
+    deterministic: cutlass.Constexpr = False,
+    mdQ_semaphore_cur: Optional[cute.Tensor] = None,
+    warp_local_tidx=None,
 ):
     """SM90 backward block sparse dQaccum store with separate partial/full loops.
 
     Iterates partial blocks first, then full blocks, matching producer/consumer order.
+    With ``deterministic``, each store is ordered by the dq_write_order ranks (the
+    n_block's position in the target m_block's contributor list -- no skip-signaling
+    needed: unlike the dense raw-n_block locks, ranks only count actual contributors).
     """
     q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
     curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
@@ -1510,28 +1543,35 @@ def dQaccum_store_block_sparse_bwd_sm90(
         curr_full_cnt = Int32(0)
         curr_full_idx = None
 
+    if const_expr(deterministic):
+        assert blocksparse_tensors.dq_write_order is not None
+        curr_write_order = blocksparse_tensors.dq_write_order[batch_idx, head_idx, n_block, None]
+        if const_expr(full_cnt is not None):
+            assert blocksparse_tensors.dq_write_order_full is not None
+            curr_write_order_full = blocksparse_tensors.dq_write_order_full[
+                batch_idx, head_idx, n_block, None
+            ]
+
     for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
         sparse_idx = iter_idx // subtile_factor
         subtile_offset = iter_idx % subtile_factor
         m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
 
         if m_block < m_block_max:
-            _store_one_dQaccum_sm90(
-                m_block,
-                sdQaccum,
-                gdQaccum,
-                num_dQ_warp_groups,
-                num_threads_per_warp_group,
-                tma_copy_bytes_dQ,
-            )
-
-    if const_expr(full_cnt is not None):
-        for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
-
-            if m_block < m_block_max:
+            if const_expr(deterministic):
+                _store_one_dQaccum_sm90(
+                    m_block,
+                    sdQaccum,
+                    gdQaccum,
+                    num_dQ_warp_groups,
+                    num_threads_per_warp_group,
+                    tma_copy_bytes_dQ,
+                    deterministic=True,
+                    mdQ_semaphore_cur=mdQ_semaphore_cur,
+                    warp_local_tidx=warp_local_tidx,
+                    lock_value=curr_write_order[sparse_idx],
+                )
+            else:
                 _store_one_dQaccum_sm90(
                     m_block,
                     sdQaccum,
@@ -1540,3 +1580,33 @@ def dQaccum_store_block_sparse_bwd_sm90(
                     num_threads_per_warp_group,
                     tma_copy_bytes_dQ,
                 )
+
+    if const_expr(full_cnt is not None):
+        for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
+            sparse_idx = iter_idx // subtile_factor
+            subtile_offset = iter_idx % subtile_factor
+            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
+
+            if m_block < m_block_max:
+                if const_expr(deterministic):
+                    _store_one_dQaccum_sm90(
+                        m_block,
+                        sdQaccum,
+                        gdQaccum,
+                        num_dQ_warp_groups,
+                        num_threads_per_warp_group,
+                        tma_copy_bytes_dQ,
+                        deterministic=True,
+                        mdQ_semaphore_cur=mdQ_semaphore_cur,
+                        warp_local_tidx=warp_local_tidx,
+                        lock_value=curr_write_order_full[sparse_idx],
+                    )
+                else:
+                    _store_one_dQaccum_sm90(
+                        m_block,
+                        sdQaccum,
+                        gdQaccum,
+                        num_dQ_warp_groups,
+                        num_threads_per_warp_group,
+                        tma_copy_bytes_dQ,
+                    )
