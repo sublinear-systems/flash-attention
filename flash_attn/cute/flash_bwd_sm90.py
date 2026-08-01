@@ -161,6 +161,10 @@ class FlashAttentionBackwardSm90:
         # bias row window: the tile needs tile_n contiguous elements per q row plus
         # alignment slack; 32 extra elements keep every cooperative copy 16B-aligned
         self.rel_row_elems = self.tile_n + 32
+        # bias tiles are produced by the otherwise-idle producer warps 1..3 through a
+        # cp.async pipeline (double-buffered), so the consumers never run a CTA-wide
+        # staging barrier; PdS drops to a single stage to fund the second bias buffer
+        self.rel_bias_stage = 2
         self.q_subtile_factor = q_subtile_factor
         # SSA batching width for the score-mod calls on the SdP accumulator. Aux-reading
         # mods default to 1 because the backward cannot promise what `__vec_size__` promises
@@ -364,7 +368,13 @@ class FlashAttentionBackwardSm90:
 
         cosize_sdS = cute.cosize(self.sPdS_layout)
         cosize_sP = cute.cosize(self.sPdS_layout) if const_expr(not self.mma_dkv_is_rs) else 0
-        cosize_sBias = self.tile_m * self.rel_row_elems if const_expr(self.has_rel_bias) else 0
+        cosize_sBias = (
+            self.rel_bias_stage * self.tile_m * self.rel_row_elems
+            if const_expr(self.has_rel_bias)
+            else 0
+        )
+        n_bias_mbar = 2 * self.rel_bias_stage if const_expr(self.has_rel_bias) else 0
+        n_ds_mbar = 2 if const_expr(self.has_dbias and self.has_rel_bias) else 0
         sLSE_struct = cute.struct.Align[
             cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.Q_stage], 128
         ]
@@ -376,6 +386,8 @@ class FlashAttentionBackwardSm90:
         class SharedStorageQKV:
             mbar_ptr_Q: cute.struct.MemRange[cutlass.Int64, self.Q_stage * 2]
             mbar_ptr_dO: cute.struct.MemRange[cutlass.Int64, self.dO_stage * 2]
+            mbar_ptr_Bias: cute.struct.MemRange[cutlass.Int64, n_bias_mbar]
+            mbar_ptr_dS: cute.struct.MemRange[cutlass.Int64, n_ds_mbar]
             sLSE: sLSE_struct
             sdPsum: sdPsum_struct
             sQ: sQ_struct
@@ -758,6 +770,47 @@ class FlashAttentionBackwardSm90:
             tx_count=self.tma_copy_bytes["Q"] + self.tma_copy_bytes["LSE"],
             defer_sync=True,
         )
+        pipeline_Bias = None
+        if const_expr(self.has_rel_bias):
+            # producer = the 96 threads of producer warps 1..3 (each issues its own
+            # cp.asyncs and arrives), consumers release elect-one-per-warp
+            bias_producer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread, 32
+            )
+            bias_consumer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread, self.num_mma_threads
+            )
+            pipeline_Bias = pipeline.PipelineCpAsync.create(
+                barrier_storage=storage.mbar_ptr_Bias.data_ptr(),
+                num_stages=self.rel_bias_stage,
+                producer_group=bias_producer_group,
+                consumer_group=bias_consumer_group,
+                # every consumer thread arrives at release (group counts threads)
+                elect_one_release=False,
+                defer_sync=True,
+            )
+        # A dedicated flusher warp (via this dS handoff pipeline) was measured at
+        # 2.5x WORSE than the drained-bottom flush on the MMA threads: one warp
+        # cannot move a full dS tile per iteration inside the producer warp group's
+        # register budget (24 regs spills massively, and even a 232/232/40 split
+        # leaves it issue-bound). Kept behind const_expr(False) as the measured
+        # negative result; see flush_dbias_loop.
+        pipeline_dS = None
+        if const_expr(False):
+            # dS-tile handoff to the flusher warp: the MMA threads produce (commit
+            # after the sdS publish barrier), warp 3 consumes (flushes the tile to
+            # the bias-gradient tensor, then releases so the next r2s may overwrite)
+            pipeline_dS = pipeline.PipelineAsync.create(
+                barrier_storage=storage.mbar_ptr_dS.data_ptr(),
+                num_stages=1,
+                producer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread, self.num_mma_threads
+                ),
+                consumer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread, 32
+                ),
+                defer_sync=True,
+            )
         pipeline_dO = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_dO.data_ptr(),
             num_stages=self.dO_stage,
@@ -779,7 +832,12 @@ class FlashAttentionBackwardSm90:
         if const_expr(self.has_rel_bias):
             sBias = storage.sBias.get_tensor(
                 cute.make_layout(
-                    (self.tile_m, self.rel_row_elems), stride=(self.rel_row_elems, 1)
+                    (self.rel_bias_stage, self.tile_m, self.rel_row_elems),
+                    stride=(
+                        self.tile_m * self.rel_row_elems,
+                        self.rel_row_elems,
+                        1,
+                    ),
                 )
             )
         sLSE = storage.sLSE.get_tensor(
@@ -829,6 +887,22 @@ class FlashAttentionBackwardSm90:
 
         if warp_idx < 4:
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
+            if const_expr(self.has_rel_bias):
+                if warp_idx == 2:
+                    # idle producer warp 2 (warp 0 = TMA loads, warp 1 = dQaccum
+                    # store): produce the bias tiles, running ahead through the
+                    # double-buffered pipeline
+                    self.load_rel_bias(
+                        mRelBias,
+                        mRelBiasParams,
+                        sBias,
+                        pipeline_Bias,
+                        block_info,
+                        SeqlenInfoCls,
+                        TileSchedulerCls,
+                    )
+
+
             if warp_idx == 0:
                 self.load(
                     mQ,
@@ -908,6 +982,8 @@ class FlashAttentionBackwardSm90:
                 mdBiasParams,
                 mRelBias,
                 mRelBiasParams,
+                pipeline_Bias,
+                pipeline_dS,
             )
             if const_expr(self.num_wg_dQ == self.num_wg_mma):
                 # Both WGs compute dQ
@@ -1233,6 +1309,8 @@ class FlashAttentionBackwardSm90:
         mdBiasParams: Optional[cute.Tensor] = None,
         mRelBias: Optional[cute.Tensor] = None,
         mRelBiasParams: Optional[cute.Tensor] = None,
+        pipeline_Bias: Optional[cutlass.pipeline.PipelineAsync] = None,
+        pipeline_dS: Optional[cutlass.pipeline.PipelineAsync] = None,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1383,6 +1461,16 @@ class FlashAttentionBackwardSm90:
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
         )
+        consumer_state_Bias = None
+        if const_expr(self.has_rel_bias):
+            consumer_state_Bias = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, self.rel_bias_stage
+            )
+        producer_state_dS = None
+        if const_expr(self.has_dbias and self.has_rel_bias):
+            producer_state_dS = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Producer, 1
+            )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1436,20 +1524,8 @@ class FlashAttentionBackwardSm90:
                 n_block=n_block,
                 seqlen_info=seqlen,
             )
-            rel_bias_load_fn_cur = None
             rel_bias_apply_fn_cur = None
             if const_expr(self.has_rel_bias):
-                rel_bias_load_fn_cur = partial(
-                    self.load_rel_bias,
-                    sBias=sBias,
-                    mRelBias=mRelBias,
-                    mRelBiasParams=mRelBiasParams,
-                    tidx=tidx,
-                    batch_idx=batch_idx,
-                    head_idx=head_idx,
-                    n_block=n_block,
-                    seqlen_info=seqlen,
-                )
                 rel_bias_apply_fn_cur = partial(
                     self.apply_rel_bias,
                     thr_mma_SdP=thr_mma_SdP,
@@ -1508,19 +1584,40 @@ class FlashAttentionBackwardSm90:
                     )
                     dKV_accumulate = False
                     for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
-                        consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
-                            m_block,
-                            consumer_state_Q,
-                            consumer_state_dO,
-                            mask_fn=mask_fn,
-                            score_mod_fn=score_mod_fn_cur,
-                            score_mod_bwd_fn=score_mod_bwd_fn_cur,
-                            dbias_flush_fn=dbias_flush_fn_cur,
-                            rel_bias_load_fn=rel_bias_load_fn_cur,
-                            rel_bias_apply_fn=rel_bias_apply_fn_cur,
-                            dKV_accumulate=dKV_accumulate,
-                            is_last_m=m_block == m_block_max - 1,
-                        )
+                        if const_expr(self.has_rel_bias):
+                            (
+                                consumer_state_Q,
+                                consumer_state_dO,
+                                consumer_state_Bias,
+                                producer_state_dS,
+                            ) = mma_one_m_block_all(
+                                m_block,
+                                consumer_state_Q,
+                                consumer_state_dO,
+                                mask_fn=mask_fn,
+                                score_mod_fn=score_mod_fn_cur,
+                                score_mod_bwd_fn=score_mod_bwd_fn_cur,
+                                dbias_flush_fn=dbias_flush_fn_cur,
+                                rel_bias_apply_fn=rel_bias_apply_fn_cur,
+                                pipeline_Bias=pipeline_Bias,
+                                consumer_state_Bias=consumer_state_Bias,
+                                pipeline_dS=pipeline_dS,
+                                producer_state_dS=producer_state_dS,
+                                dKV_accumulate=dKV_accumulate,
+                                is_last_m=m_block == m_block_max - 1,
+                            )
+                        else:
+                            consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
+                                m_block,
+                                consumer_state_Q,
+                                consumer_state_dO,
+                                mask_fn=mask_fn,
+                                score_mod_fn=score_mod_fn_cur,
+                                score_mod_bwd_fn=score_mod_bwd_fn_cur,
+                                dbias_flush_fn=dbias_flush_fn_cur,
+                                dKV_accumulate=dKV_accumulate,
+                                is_last_m=m_block == m_block_max - 1,
+                            )
                         dKV_accumulate = True
                 else:
                     consumer_state_Q, consumer_state_dO = consume_block_sparse_mma_bwd_sm90(
@@ -1618,75 +1715,109 @@ class FlashAttentionBackwardSm90:
     @cute.jit
     def load_rel_bias(
         self,
-        m_block,
-        sBias: cute.Tensor,
         mRelBias: cute.Tensor,
         mRelBiasParams: cute.Tensor,
-        tidx: Int32,
-        batch_idx,
-        head_idx,
-        n_block,
-        seqlen_info: SeqlenInfoQK,
+        sBias: cute.Tensor,
+        pipeline_Bias: cutlass.pipeline.PipelineAsync,
+        block_info: BlockInfo,
+        SeqlenInfoCls: Callable,
+        TileSchedulerCls: Callable,
     ):
-        """Cooperatively stage the tile's bias rows into smem with 16B vector copies.
+        """Bias-tile producer, run on the otherwise-idle producer warps 2..3
+        (warp 0 issues the TMA loads, warp 1 stores dQaccum).
+
+        Walks the same (tile, m-iteration) sequence as the consumers and stages each
+        iteration's bias rows into the double-buffered sBias through a cp.async
+        pipeline: producer_acquire -> 16B cp.asyncs -> producer_commit (per-thread
+        cp.async mbarrier arrive). Consumers only mbarrier-wait -- no CTA barrier,
+        so the MMA warp groups keep their skew.
 
         The bias is additive in relative (distance) layout: flat = P0*b + P1*h +
         P2*q + P3*kv + P4 with P3 == -1, so for a fixed q row the tile's tile_n
-        elements are CONTIGUOUS (descending in kv). Each row's window is fetched
-        from the 8-element-aligned floor of its minimum index; the reader
-        reconstructs the same alignment offset arithmetically. The caller must pad
-        the bias tensor so every window read is in bounds (tile_n elements of left
-        padding, rel_row_elems of right padding).
+        elements are CONTIGUOUS (descending in kv). Each row window is fetched from
+        the 8-element-aligned floor of its minimum index; the reader reconstructs
+        the alignment offset arithmetically. The caller pads the bias tensor so
+        every window read is in bounds.
 
-        Thread mapping: 4 threads per q row, rel_row_elems/32 vector copies each;
-        consecutive threads fetch consecutive 16B chunks of the same row.
+        Thread mapping: 64 threads walk row-major (row, chunk) pairs -- consecutive
+        threads fetch consecutive 16B chunks, coalesced within each row.
         """
+        chunks_per_row = cutlass.const_expr(self.rel_row_elems // 8)
+        n_chunks = cutlass.const_expr(self.tile_m * chunks_per_row)
+        passes = cutlass.const_expr((n_chunks + 31) // 32)
+        copy_atom_128 = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), self.dtype, num_bits_per_copy=128
+        )
+        tidx = cute.arch.thread_idx()[0] - 64  # producer warp 2 -> [0, 32)
         P0 = mRelBiasParams[0]
         P1 = mRelBiasParams[1]
         P2 = mRelBiasParams[2]
         P4 = mRelBiasParams[4]
-        chunks_per_seg = cutlass.const_expr(self.rel_row_elems // 32)
-        copy_atom_128 = cute.make_copy_atom(
-            cpasync.CopyG2SOp(), self.dtype, num_bits_per_copy=128
+        # bias tensors are kernel inputs: under programmatic dependent launch they
+        # may still be written by the previous kernel at this point
+        cute.arch.griddepcontrol_wait()
+        producer_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.rel_bias_stage
         )
-        r = tidx // 4
-        seg = tidx % 4
-        # clamp: a speculative prefetch past the last m iteration must stay in
-        # bounds; rows past seqlen are seqlen-masked downstream anyway
-        q = cutlass.min(m_block * self.tile_m + r, seqlen_info.seqlen_q - 1)
-        kv_hi = n_block * self.tile_n + self.tile_n - 1
-        fmin = P0 * batch_idx + P1 * head_idx + P2 * q - kv_hi + P4
-        a0 = fmin - (fmin & 7)
-        for ch in cutlass.range(chunks_per_seg, unroll_full=True):
-            off = (seg * chunks_per_seg + ch) * 8
-            # Both sides are 16B aligned by contract -- a0 is 8-element aligned on a
-            # 16B-aligned bias tensor, and sBias rows are rel_row_elems (a multiple
-            # of 8) apart from a 1024B-aligned base -- but the pointer arithmetic
-            # erases that statically, so re-stamp the alignment assumption.
-            gsrc_ptr = cute.make_ptr(
-                self.dtype,
-                (mRelBias.iterator + a0 + off).toint(),
-                mRelBias.memspace,
-                assumed_align=16,
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            process_tile = (
+                const_expr(not self.is_local and not self.is_varlen_q)
+                or m_block_min < m_block_max
             )
-            sdst_ptr = cute.make_ptr(
-                self.dtype,
-                (sBias.iterator + r * self.rel_row_elems + off).toint(),
-                sBias.memspace,
-                assumed_align=16,
-            )
-            gsrc = cute.make_tensor(gsrc_ptr, cute.make_layout(8))
-            sdst = cute.make_tensor(sdst_ptr, cute.make_layout(8))
-            cute.copy(copy_atom_128, gsrc, sdst)
-        # fire-and-forget: committed here, drained right before the visibility
-        # barrier at the apply site
-        cute.arch.cp_async_commit_group()
+            if process_tile:
+                kv_hi = n_block * self.tile_n + self.tile_n - 1
+                c1 = P0 * batch_idx + P1 * head_idx - kv_hi + P4
+                for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
+                    pipeline_Bias.producer_acquire(producer_state)
+                    buf = producer_state.index
+                    sbase = sBias.iterator + buf * (self.tile_m * self.rel_row_elems)
+                    for k in cutlass.range(passes, unroll=1):
+                        g = tidx + k * 32
+                        if g < n_chunks:
+                            r = g // chunks_per_row
+                            ch = g - r * chunks_per_row
+                            q = cutlass.min(
+                                m_block * self.tile_m + r, seqlen.seqlen_q - 1
+                            )
+                            fmin = c1 + P2 * q
+                            a0 = fmin - (fmin & 7)
+                            gsrc_ptr = cute.make_ptr(
+                                self.dtype,
+                                (mRelBias.iterator + a0 + ch * 8).toint(),
+                                mRelBias.memspace,
+                                assumed_align=16,
+                            )
+                            sdst_ptr = cute.make_ptr(
+                                self.dtype,
+                                (sbase + r * self.rel_row_elems + ch * 8).toint(),
+                                sBias.memspace,
+                                assumed_align=16,
+                            )
+                            cute.copy(
+                                copy_atom_128,
+                                cute.make_tensor(gsrc_ptr, cute.make_layout(8)),
+                                cute.make_tensor(sdst_ptr, cute.make_layout(8)),
+                            )
+                    # cp.async completion arrive: orders the async-proxy smem
+                    # writes for the consumers' acquire, which a plain arrive after
+                    # a wait_group does NOT (async->generic proxy visibility)
+                    pipeline_Bias.producer_commit(producer_state)
+                    producer_state.advance()
+            tile_scheduler.prefetch_next_work()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
     def apply_rel_bias(
         self,
         acc_S: cute.Tensor,
         m_block,
+        buf,
         thr_mma_SdP: cute.ThrMma,
         sBias: cute.Tensor,
         mRelBiasParams: cute.Tensor,
@@ -1731,8 +1862,83 @@ class FlashAttentionBackwardSm90:
             kv = tScS[i][kv_pos]
             fmin = c1 + P2 * q
             col = (fmin & 7) + (kv_hi - kv)
-            val = sBias[q - m0, col]
+            val = sBias[buf, q - m0, col]
             acc_S[i] = acc_S[i] * softmax_scale + cutlass.Float32(val)
+
+    @cute.jit
+    def flush_dbias_loop(
+        self,
+        mdBias: cute.Tensor,
+        mdBiasParams: cute.Tensor,
+        sdS: cute.Tensor,
+        pipeline_dS: cutlass.pipeline.PipelineAsync,
+        block_info: BlockInfo,
+        SeqlenInfoCls: Callable,
+        TileSchedulerCls: Callable,
+    ):
+        """Bias-gradient flusher, run on the otherwise-idle producer warp 3.
+
+        Trails the MMA warp groups through the same (tile, m-iteration) walk: waits
+        for each iteration's converted dS tile (committed by the MMA threads after
+        the sdS publish barrier), copies it to the bias-gradient tensor with the
+        affine index/validity convention of flush_dbias, and releases the stage so
+        the next r2s may overwrite it. This takes the flush entirely off the MMA
+        critical path -- with a single PdS stage the bottom-of-iteration flush
+        otherwise serializes against the next iteration's r2s.
+
+        Thread mapping: 32 threads walk kv columns in two coalesced 64-wide
+        stripes per q row.
+        """
+        P0 = mdBiasParams[0]
+        P1 = mdBiasParams[1]
+        P2 = mdBiasParams[2]
+        P3 = mdBiasParams[3]
+        P4 = mdBiasParams[4]
+        P5 = mdBiasParams[5]
+        P6 = mdBiasParams[6]
+        P7 = mdBiasParams[7]
+        P8 = mdBiasParams[8]
+        dust = cute.size(mdBias.shape) - 1
+        stripes = cutlass.const_expr(self.tile_n // 32)
+        tidx = cute.arch.thread_idx()[0] - 96  # producer warp 3 -> [0, 32)
+        consumer_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, 1
+        )
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            process_tile = (
+                const_expr(not self.is_local and not self.is_varlen_q)
+                or m_block_min < m_block_max
+            )
+            if process_tile:
+                base0 = P0 * batch_idx + P1 * head_idx + P4
+                for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
+                    pipeline_dS.consumer_wait(
+                        consumer_state, pipeline_dS.consumer_try_wait(consumer_state)
+                    )
+                    for st in cutlass.range_constexpr(stripes):
+                        c = tidx + st * 32
+                        kv = n_block * self.tile_n + c
+                        base = base0 + P3 * kv
+                        dcol = P6 * kv + P7
+                        kv_ok = kv < seqlen.seqlen_k
+                        for r in cutlass.range(self.tile_m, unroll=4):
+                            q = m_block * self.tile_m + r
+                            d = P5 * q + dcol
+                            ok = kv_ok & (d >= 0) & (d < P8) & (q < seqlen.seqlen_q)
+                            tgt = cutlass.Int32(
+                                cutlass.select_(ok, base + P2 * q, dust)
+                            )
+                            mdBias[tgt] = sdS[r, c, 0]
+                    pipeline_dS.consumer_release(consumer_state)
+                    consumer_state.advance()
+            tile_scheduler.prefetch_next_work()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
     def flush_dbias(
@@ -1811,8 +2017,11 @@ class FlashAttentionBackwardSm90:
         score_mod_fn: Optional[Callable] = None,
         score_mod_bwd_fn: Optional[Callable] = None,
         dbias_flush_fn: Optional[Callable] = None,
-        rel_bias_load_fn: Optional[Callable] = None,
         rel_bias_apply_fn: Optional[Callable] = None,
+        pipeline_Bias: Optional[cutlass.pipeline.PipelineAsync] = None,
+        consumer_state_Bias=None,
+        pipeline_dS: Optional[cutlass.pipeline.PipelineAsync] = None,
+        producer_state_dS=None,
         dKV_accumulate: Boolean = True,
         is_last_m: Boolean = True,
     ):
@@ -1825,14 +2034,6 @@ class FlashAttentionBackwardSm90:
         # (1) [GEMM 1] S = Q @ K^T
         pipeline_Q.consumer_wait(consumer_state_Q, pipeline_Q.consumer_try_wait(consumer_state_Q))
         acc_S = mma_qk_fn(A_idx=smem_idx_Q, wg_wait=-1)
-        if const_expr(rel_bias_load_fn is not None):
-            # Pipeline warm-up: only a tile's FIRST m iteration loads its own bias
-            # rows here (one exposed load per (n_block, head) tile). Every later
-            # iteration's rows were prefetched right after the previous apply, a
-            # full GEMM round earlier.
-            if not dKV_accumulate:
-                rel_bias_load_fn(m_block=m_block)
-                cute.arch.cp_async_commit_group()
         # If shuffle_LSE, OOB reads are OK since sLSE is already padded
         tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, smem_idx_Q])
         # (2) [GEMM 2] dP = dO @ V.T
@@ -1850,15 +2051,16 @@ class FlashAttentionBackwardSm90:
             score_mod_fn(acc_S, m_block=m_block)
 
         if const_expr(rel_bias_apply_fn is not None):
-            # drain the buffer's cp.async group, make it visible tile-wide, apply,
-            # then -- once every thread is done reading -- start the NEXT iteration's
-            # prefetch so its DRAM latency hides behind the rest of this iteration.
-            cute.arch.cp_async_wait_group(0)
-            PdS_barrier.arrive_and_wait()
-            rel_bias_apply_fn(acc_S, m_block=m_block)
-            PdS_barrier.arrive_and_wait()
-            rel_bias_load_fn(m_block=m_block + 1)
-            cute.arch.cp_async_commit_group()
+            # per-thread mbarrier wait on the producer warps' staged tile (release
+            # semantics make their cp.asyncs visible) -- NO CTA barrier, the MMA
+            # warp groups keep their skew; release lets the producers refill the
+            # buffer two iterations out
+            pipeline_Bias.consumer_wait(
+                consumer_state_Bias, pipeline_Bias.consumer_try_wait(consumer_state_Bias)
+            )
+            rel_bias_apply_fn(acc_S, m_block=m_block, buf=consumer_state_Bias.index)
+            pipeline_Bias.consumer_release(consumer_state_Bias)
+            consumer_state_Bias.advance()
 
 
 
@@ -1908,6 +2110,9 @@ class FlashAttentionBackwardSm90:
             cute.arch.fence_view_async_shared()
             PdS_barrier.arrive_and_wait()
 
+        if const_expr(pipeline_dS is not None):
+            # wait until the flusher warp released the (single) dS stage
+            pipeline_dS.producer_acquire(producer_state_dS)
         # R2S for dS
         copy_dS_r2s(tdKrdS, dst_idx=smem_idx_PdS)
 
@@ -1922,6 +2127,11 @@ class FlashAttentionBackwardSm90:
         # smem fence to make sure sdS is written before it's read by WGMMA
         cute.arch.fence_view_async_shared()
         PdS_barrier.arrive_and_wait()
+
+        if const_expr(pipeline_dS is not None):
+            # tile-wide visible: hand the dS stage to the flusher warp
+            pipeline_dS.producer_commit(producer_state_dS)
+            producer_state_dS.advance()
 
         if const_expr(is_dQ_wg):
             # (6) [GEMM 4] dQ = dS @ K
@@ -1967,14 +2177,21 @@ class FlashAttentionBackwardSm90:
             warpgroup.wait_group(0)
             pipeline_Q.consumer_release(consumer_state_Q)
 
-        if const_expr(dbias_flush_fn is not None):
-            # After wait_group(0): the dQ/dK GEMMs that read sdS have drained and
-            # every heavy fragment is retired -- the flush's smem reads and gmem
-            # stores cannot interleave with any load window here.
+        if const_expr(dbias_flush_fn is not None and pipeline_dS is None):
+            # no flusher warp: drained-bottom flush, the only spill-safe MMA-side home
             dbias_flush_fn(m_block=m_block, smem_idx=smem_idx_PdS)
 
         consumer_state_Q.advance()
         consumer_state_dO.advance()
+        if const_expr(rel_bias_apply_fn is not None):
+            # pipeline states have value semantics across cute.jit calls: hand the
+            # advanced states back to the caller like the Q/dO states
+            return (
+                consumer_state_Q,
+                consumer_state_dO,
+                consumer_state_Bias,
+                producer_state_dS,
+            )
         return consumer_state_Q, consumer_state_dO
 
     @cute.jit
