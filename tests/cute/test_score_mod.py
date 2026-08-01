@@ -1148,6 +1148,76 @@ def test_cute_vs_flex_attention_backward_with_aux(
     assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (256, 128)])
+@pytest.mark.parametrize("dim", [128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2), (2, 4)])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
+def test_cute_vs_flex_attention_backward_with_aux_gqa(
+    seqlen_q, seqlen_kv, dim, dtype, qhead_per_kvhead, num_kv_heads, score_mod_triple
+):
+    """GQA (num_q_heads != num_kv_heads) backward with aux-reading score mods.
+
+    The plain-GQA backward path (no Pack-GQA) hands score mods the query index and
+    the query-head index directly. A score mod that indexes aux tensors by q_idx or
+    head_idx therefore reads garbage if those indices are transformed on the way in,
+    which shows up as wrong dQ/dK/dV -- forward-only tests cannot see it, and the
+    Pack-GQA backward test xfails on SM90, so this is the case that pins it.
+    """
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_factory = score_mod_triple
+
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    q, _, _ = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dim=dim, dtype=dtype
+    )
+    _, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_kv_heads, dim=dim, dtype=dtype
+    )
+
+    aux_tensors, eager_ref = make_aux_tensors_for_bwd(
+        cute_fwd, eager_factory, seqlen_q, num_q_heads, q.shape[0], dtype
+    )
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, cute_fwd, cute_bwd, aux_tensors=aux_tensors
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, eager_ref, grad_out)
+
+    assert not torch.isnan(dq_cute).any()
+    assert not torch.isnan(dk_cute).any()
+    assert not torch.isnan(dv_cute).any()
+
+    rtol = 3
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print(f"\nGQA backward with aux for {cute_fwd.__name__} (g={qhead_per_kvhead}):")
+    print(f"  dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (128, 256)])
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
