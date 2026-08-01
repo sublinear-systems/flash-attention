@@ -133,10 +133,25 @@ class FlashAttentionBackwardSm90:
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         self.q_subtile_factor = q_subtile_factor
-        if cutlass.const_expr(has_aux_tensors):
-            self.vec_size: cutlass.Constexpr = 1
-        else:
-            self.vec_size: cutlass.Constexpr = 4
+        # SSA batching width for the score-mod calls on the SdP accumulator. Aux-reading
+        # mods default to 1 because the backward cannot promise what `__vec_size__` promises
+        # on the forward: with SdP_swapAB the accumulator is transposed, so a thread's
+        # consecutive fragment elements walk q, not kv, and a mod that assumes "vec_size
+        # adjacent kv indices for one q row" would read the wrong elements.
+        #
+        # `__bwd_vec_size__` is the opt-in for mods that index strictly per lane (one
+        # scalar access per element, using the q_idx/kv_idx SSA lanes as given, no
+        # adjacency assumption). Those mods are correct at any width and batching their
+        # SSA ops cuts the per-element index and arithmetic overhead. It is deliberately
+        # a separate attribute from `__vec_size__` so a mod written for the forward's
+        # vectorized contract never silently changes backward behaviour.
+        default_vec_size: cutlass.Constexpr = 1 if cutlass.const_expr(has_aux_tensors) else 4
+        self.vec_size: cutlass.Constexpr = min(
+            getattr(score_mod, "__bwd_vec_size__", default_vec_size),
+            getattr(score_mod_bwd, "__bwd_vec_size__", default_vec_size),
+        )
+        if self.vec_size < 1:
+            raise ValueError(f"__bwd_vec_size__ must be >= 1, got {self.vec_size}")
         self.qk_acc_dtype = Float32
         # dQ_single_wg: WG0 computes the full dQ GEMM, WG1 skips it.
         # Only valid for 2 MMA warp groups.
