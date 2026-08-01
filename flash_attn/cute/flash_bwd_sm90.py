@@ -129,6 +129,13 @@ class FlashAttentionBackwardSm90:
 
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
+        # A score_mod_bwd whose joint graph does not use the pre-mod score (any additive
+        # bias, and every mod whose derivative depends only on the indices) can set
+        # `__needs_scores__ = False` to skip staging it: the kernel then keeps neither the
+        # fp32 copy of the S tile nor the per-element reads of it.
+        self.score_mod_bwd_needs_scores: cutlass.Constexpr = getattr(
+            score_mod_bwd, "__needs_scores__", True
+        )
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         self.subtile_factor = subtile_factor
@@ -1126,6 +1133,7 @@ class FlashAttentionBackwardSm90:
             # qhead_per_kvhead instead of the real coordinates.
             qhead_per_kvhead=1,
             transpose_indices=self.SdP_swapAB,
+            needs_scores=self.score_mod_bwd_needs_scores,
         )
 
     @cute.jit
@@ -1531,7 +1539,8 @@ class FlashAttentionBackwardSm90:
         )
         acc_dP = mma_dov_fn(A_idx=smem_idx_Q, wg_wait=1)
 
-        if const_expr(self.score_mod_bwd is not None):
+        acc_S_pre = None
+        if const_expr(self.score_mod_bwd is not None and self.score_mod_bwd_needs_scores):
             acc_S_pre = cute.make_fragment_like(acc_S)
             cute.autovec_copy(acc_S, acc_S_pre)
 

@@ -523,12 +523,14 @@ def apply_score_mod_bwd_inner(
     constant_q_idx: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     transpose_indices: cutlass.Constexpr[bool] = False,
+    needs_scores: cutlass.Constexpr[bool] = True,
 ):
     """Apply backward score modification (joint graph).
 
     Args:
         grad_tensor: in/out: dlogits rewritten in-place with d(scaled_scores)
-        score_tensor: pre-mod scores (unscaled QK tile), scaled by softmax_scale internally
+        score_tensor: pre-mod scores (unscaled QK tile), scaled by softmax_scale internally.
+            May be None when needs_scores is False.
         index_tensor: Index positions (same as forward)
         score_mod_bwd: The backward score modification function (joint graph)
         batch_idx: Batch index
@@ -542,6 +544,10 @@ def apply_score_mod_bwd_inner(
         constant_q_idx: If provided, use this constant for all q_idx values
         qhead_per_kvhead: Pack-GQA replication factor
         transpose_indices: If True, swap q_idx/kv_idx in index_tensor
+        needs_scores: Whether the joint graph reads the pre-mod score. False lets the
+            caller skip staging the score tile entirely (the mod is handed zeros), which
+            is what an additive bias -- or any mod whose derivative depends only on the
+            indices -- wants.
     """
     # Index positions in the index_tensor tuple
     # Forward: index_tensor[...][0] = q_idx, index_tensor[...][1] = kv_idx
@@ -559,7 +565,8 @@ def apply_score_mod_bwd_inner(
             f"size {n_vals}"
         )
     grad_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
-    score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    if cutlass.const_expr(needs_scores):
+        score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
     kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
     q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
@@ -571,8 +578,9 @@ def apply_score_mod_bwd_inner(
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):
             grad_vec[j] = grad_tensor[i + j]
-            # Scale score so joint graph sees same value as forward score_mod
-            score_vec[j] = score_tensor[i + j] * softmax_scale
+            if cutlass.const_expr(needs_scores):
+                # Scale score so joint graph sees same value as forward score_mod
+                score_vec[j] = score_tensor[i + j] * softmax_scale
 
             if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
                 q_idx_packed = index_tensor[i + j][q_idx_pos]
@@ -600,7 +608,12 @@ def apply_score_mod_bwd_inner(
                 kv_idx_vec[j] = index_tensor[i + j][kv_idx_pos]
 
         grad_ssa = grad_vec.load()
-        score_ssa = score_vec.load()
+        if cutlass.const_expr(needs_scores):
+            score_ssa = score_vec.load()
+        else:
+            score_ssa = utils.scalar_to_ssa(qk_acc_dtype(0.0), qk_acc_dtype).broadcast_to(
+                (vec_size,)
+            )
         kv_idx_ssa = kv_idx_vec.load()
 
         if cutlass.const_expr(constant_q_idx is None):
