@@ -159,8 +159,14 @@ class FlashAttentionBackwardSm90:
                 "rel_bias replaces score_mod in the backward"
             )
         # bias row window: the tile needs tile_n contiguous elements per q row plus
-        # alignment slack; 32 extra elements keep every cooperative copy 16B-aligned
-        self.rel_row_elems = self.tile_n + 32
+        # 4 elements of alignment slack (the 8B cp.async chunks start at the
+        # 4-element floor of each row's minimum index). Two effects vs the old
+        # +32/16B scheme: (1) the double-buffered sBias fits the SM90 smem budget
+        # next to a 2-stage PdS, and (2) the smem row stride becomes 66 words, so
+        # the four q-rows (spaced 2) that one WGMMA-fragment apply instruction
+        # touches land 4 banks apart instead of all on one bank -- the old 80-word
+        # stride made every bias read of the apply loop a 4-way conflict.
+        self.rel_row_elems = self.tile_n + 4
         # bias tiles are produced by the otherwise-idle producer warps 1..3 through a
         # cp.async pipeline (double-buffered), so the consumers never run a CTA-wide
         # staging barrier; PdS drops to a single stage to fund the second bias buffer
@@ -772,10 +778,11 @@ class FlashAttentionBackwardSm90:
         )
         pipeline_Bias = None
         if const_expr(self.has_rel_bias):
-            # producer = the 96 threads of producer warps 1..3 (each issues its own
-            # cp.asyncs and arrives), consumers release elect-one-per-warp
+            # producer = the 64 threads of producer warps 2..3 (each issues its own
+            # cp.asyncs and arrives at commit); every consumer thread arrives at
+            # release
             bias_producer_group = cutlass.pipeline.CooperativeGroup(
-                cutlass.pipeline.Agent.Thread, 32
+                cutlass.pipeline.Agent.Thread, 64
             )
             bias_consumer_group = cutlass.pipeline.CooperativeGroup(
                 cutlass.pipeline.Agent.Thread, self.num_mma_threads
@@ -888,10 +895,10 @@ class FlashAttentionBackwardSm90:
         if warp_idx < 4:
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
             if const_expr(self.has_rel_bias):
-                if warp_idx == 2:
-                    # idle producer warp 2 (warp 0 = TMA loads, warp 1 = dQaccum
-                    # store): produce the bias tiles, running ahead through the
-                    # double-buffered pipeline
+                if warp_idx > 1:
+                    # otherwise-idle producer warps 2..3 (warp 0 = TMA loads,
+                    # warp 1 = dQaccum store): produce the bias tiles, running
+                    # ahead through the double-buffered pipeline
                     self.load_rel_bias(
                         mRelBias,
                         mRelBiasParams,
@@ -1728,27 +1735,27 @@ class FlashAttentionBackwardSm90:
 
         Walks the same (tile, m-iteration) sequence as the consumers and stages each
         iteration's bias rows into the double-buffered sBias through a cp.async
-        pipeline: producer_acquire -> 16B cp.asyncs -> producer_commit (per-thread
+        pipeline: producer_acquire -> 8B cp.asyncs -> producer_commit (per-thread
         cp.async mbarrier arrive). Consumers only mbarrier-wait -- no CTA barrier,
         so the MMA warp groups keep their skew.
 
         The bias is additive in relative (distance) layout: flat = P0*b + P1*h +
         P2*q + P3*kv + P4 with P3 == -1, so for a fixed q row the tile's tile_n
         elements are CONTIGUOUS (descending in kv). Each row window is fetched from
-        the 8-element-aligned floor of its minimum index; the reader reconstructs
+        the 4-element-aligned floor of its minimum index; the reader reconstructs
         the alignment offset arithmetically. The caller pads the bias tensor so
         every window read is in bounds.
 
-        Thread mapping: 64 threads walk row-major (row, chunk) pairs -- consecutive
-        threads fetch consecutive 16B chunks, coalesced within each row.
+        Thread mapping: 32 threads walk row-major (row, chunk) pairs -- consecutive
+        threads fetch consecutive 8B chunks, coalesced within each row.
         """
-        chunks_per_row = cutlass.const_expr(self.rel_row_elems // 8)
+        chunks_per_row = cutlass.const_expr(self.rel_row_elems // 4)
         n_chunks = cutlass.const_expr(self.tile_m * chunks_per_row)
-        passes = cutlass.const_expr((n_chunks + 31) // 32)
-        copy_atom_128 = cute.make_copy_atom(
-            cpasync.CopyG2SOp(), self.dtype, num_bits_per_copy=128
+        passes = cutlass.const_expr((n_chunks + 63) // 64)
+        copy_atom_64 = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), self.dtype, num_bits_per_copy=64
         )
-        tidx = cute.arch.thread_idx()[0] - 64  # producer warp 2 -> [0, 32)
+        tidx = cute.arch.thread_idx()[0] - 64  # producer warps 2..3 -> [0, 64)
         P0 = mRelBiasParams[0]
         P1 = mRelBiasParams[1]
         P2 = mRelBiasParams[2]
@@ -1777,7 +1784,7 @@ class FlashAttentionBackwardSm90:
                     buf = producer_state.index
                     sbase = sBias.iterator + buf * (self.tile_m * self.rel_row_elems)
                     for k in cutlass.range(passes, unroll=1):
-                        g = tidx + k * 32
+                        g = tidx + k * 64
                         if g < n_chunks:
                             r = g // chunks_per_row
                             ch = g - r * chunks_per_row
@@ -1785,23 +1792,23 @@ class FlashAttentionBackwardSm90:
                                 m_block * self.tile_m + r, seqlen.seqlen_q - 1
                             )
                             fmin = c1 + P2 * q
-                            a0 = fmin - (fmin & 7)
+                            a0 = fmin - (fmin & 3)
                             gsrc_ptr = cute.make_ptr(
                                 self.dtype,
-                                (mRelBias.iterator + a0 + ch * 8).toint(),
+                                (mRelBias.iterator + a0 + ch * 4).toint(),
                                 mRelBias.memspace,
-                                assumed_align=16,
+                                assumed_align=8,
                             )
                             sdst_ptr = cute.make_ptr(
                                 self.dtype,
-                                (sbase + r * self.rel_row_elems + ch * 8).toint(),
+                                (sbase + r * self.rel_row_elems + ch * 4).toint(),
                                 sBias.memspace,
-                                assumed_align=16,
+                                assumed_align=8,
                             )
                             cute.copy(
-                                copy_atom_128,
-                                cute.make_tensor(gsrc_ptr, cute.make_layout(8)),
-                                cute.make_tensor(sdst_ptr, cute.make_layout(8)),
+                                copy_atom_64,
+                                cute.make_tensor(gsrc_ptr, cute.make_layout(4)),
+                                cute.make_tensor(sdst_ptr, cute.make_layout(4)),
                             )
                     # cp.async completion arrive: orders the async-proxy smem
                     # writes for the consumers' acquire, which a plain arrive after
@@ -1828,7 +1835,7 @@ class FlashAttentionBackwardSm90:
     ):
         """acc_S = acc_S * softmax_scale + bias, bias read from the smem-staged tile.
 
-        Index math mirrors load_rel_bias: smem col = (fmin(q) mod 8) + (kv_hi - kv).
+        Index math mirrors load_rel_bias: smem col = (fmin(q) mod 4) + (kv_hi - kv).
         Reads out of the bias's logical support hit the caller's padding and are
         masked to -inf downstream (application is premask), exactly like a premask
         score modification.
@@ -1861,7 +1868,7 @@ class FlashAttentionBackwardSm90:
             q = tScS[i][q_pos]
             kv = tScS[i][kv_pos]
             fmin = c1 + P2 * q
-            col = (fmin & 7) + (kv_hi - kv)
+            col = (fmin & 3) + (kv_hi - kv)
             val = sBias[buf, q - m0, col]
             acc_S[i] = acc_S[i] * softmax_scale + cutlass.Float32(val)
 

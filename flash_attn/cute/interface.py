@@ -1427,10 +1427,6 @@ def _flash_attn_bwd(
         num_stages_Q = cfg.num_stages_Q
         num_stages_dO = cfg.num_stages_dO
         num_stages_PdS = cfg.num_stages_PdS
-        if rel_bias is not None:
-            # the double-buffered bias stage is funded by dropping PdS to a single
-            # stage; the dS handoff pipeline orders the buffer reuse
-            num_stages_PdS = 1
         SdP_swapAB = cfg.SdP_swapAB
         dKV_swapAB = cfg.dKV_swapAB
         dQ_swapAB = cfg.dQ_swapAB
