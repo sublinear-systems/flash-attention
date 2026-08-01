@@ -74,6 +74,8 @@ class FlashAttentionBackwardSm90:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
+        has_dbias: cutlass.Constexpr = False,
+        has_rel_bias: cutlass.Constexpr = False,
     ):
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size, or 64 when
@@ -139,6 +141,26 @@ class FlashAttentionBackwardSm90:
         )
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
+        # Additive-bias gradient sink: dS w.r.t. an additive attention bias IS the
+        # bias's gradient, and the dS tile already sits in smem for the dQ/dK GEMMs
+        # -- so the gradient is emitted as a plain smem->gmem copy after those GEMMs
+        # drain, outside the register-critical softmax/GEMM region (no per-element
+        # gmem scatter in the hot loop, no atomics, single writer per element).
+        self.has_dbias = has_dbias
+        # Additive bias in relative (distance) layout, staged through smem: each
+        # m-iteration cooperatively vector-loads the tile's bias rows (contiguous
+        # per q row) into sBias while GEMM1 runs, and the softmax recompute reads
+        # bias from smem -- no per-element gmem gathers inside the register-critical
+        # region. Requires score_mod=None; the affine row addressing contract is
+        # documented on load_rel_bias/apply_rel_bias.
+        self.has_rel_bias = has_rel_bias
+        if has_rel_bias:
+            assert score_mod is None and score_mod_bwd is None, (
+                "rel_bias replaces score_mod in the backward"
+            )
+        # bias row window: the tile needs tile_n contiguous elements per q row plus
+        # alignment slack; 32 extra elements keep every cooperative copy 16B-aligned
+        self.rel_row_elems = self.tile_n + 32
         self.q_subtile_factor = q_subtile_factor
         # SSA batching width for the score-mod calls on the SdP accumulator. Aux-reading
         # mods default to 1 because the backward cannot promise what `__vec_size__` promises
@@ -342,6 +364,7 @@ class FlashAttentionBackwardSm90:
 
         cosize_sdS = cute.cosize(self.sPdS_layout)
         cosize_sP = cute.cosize(self.sPdS_layout) if const_expr(not self.mma_dkv_is_rs) else 0
+        cosize_sBias = self.tile_m * self.rel_row_elems if const_expr(self.has_rel_bias) else 0
         sLSE_struct = cute.struct.Align[
             cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.Q_stage], 128
         ]
@@ -361,6 +384,7 @@ class FlashAttentionBackwardSm90:
             sdO: sdO_struct
             sP: cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
             sdS: cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sdS], 1024]
+            sBias: cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sBias], 1024]
             sdQaccum: sdQaccum_struct
 
         return SharedStorageQKV
@@ -387,6 +411,10 @@ class FlashAttentionBackwardSm90:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
+        mdBias: Optional[cute.Tensor] = None,
+        mdBiasParams: Optional[cute.Tensor] = None,
+        mRelBias: Optional[cute.Tensor] = None,
+        mRelBiasParams: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -574,7 +602,7 @@ class FlashAttentionBackwardSm90:
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
         LOG2_E = math.log2(math.e)
-        if const_expr(self.score_mod is None):
+        if const_expr(self.score_mod is None and not self.has_rel_bias):
             softmax_scale_log2 = softmax_scale * LOG2_E
         else:
             softmax_scale_log2 = LOG2_E
@@ -641,6 +669,10 @@ class FlashAttentionBackwardSm90:
             mdQ_semaphore,
             mdK_semaphore,
             mdV_semaphore,
+            mdBias,
+            mdBiasParams,
+            mRelBias,
+            mRelBiasParams,
             window_size_left,
             window_size_right,
         ).launch(
@@ -696,6 +728,10 @@ class FlashAttentionBackwardSm90:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
+        mdBias: Optional[cute.Tensor] = None,
+        mdBiasParams: Optional[cute.Tensor] = None,
+        mRelBias: Optional[cute.Tensor] = None,
+        mRelBiasParams: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ):
@@ -739,6 +775,13 @@ class FlashAttentionBackwardSm90:
         if const_expr(not self.mma_dkv_is_rs):
             sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+        sBias = None
+        if const_expr(self.has_rel_bias):
+            sBias = storage.sBias.get_tensor(
+                cute.make_layout(
+                    (self.tile_m, self.rel_row_elems), stride=(self.rel_row_elems, 1)
+                )
+            )
         sLSE = storage.sLSE.get_tensor(
             cute.make_layout(
                 (self.tile_m, self.Q_stage),
@@ -841,6 +884,7 @@ class FlashAttentionBackwardSm90:
                 sdO,
                 sP,
                 sdS,
+                sBias,
                 sLSE,
                 sdPsum,
                 sdQaccum,
@@ -860,6 +904,10 @@ class FlashAttentionBackwardSm90:
                 fastdiv_mods,
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
+                mdBias,
+                mdBiasParams,
+                mRelBias,
+                mRelBiasParams,
             )
             if const_expr(self.num_wg_dQ == self.num_wg_mma):
                 # Both WGs compute dQ
@@ -1161,6 +1209,7 @@ class FlashAttentionBackwardSm90:
         sdO: cute.Tensor,
         sP: Optional[cute.Tensor],
         sdS: cute.Tensor,
+        sBias: Optional[cute.Tensor],
         sLSE: cute.Tensor,
         sdPsum: cute.Tensor,
         sdQaccum: cute.Tensor,
@@ -1180,6 +1229,10 @@ class FlashAttentionBackwardSm90:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        mdBias: Optional[cute.Tensor] = None,
+        mdBiasParams: Optional[cute.Tensor] = None,
+        mRelBias: Optional[cute.Tensor] = None,
+        mRelBiasParams: Optional[cute.Tensor] = None,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1383,6 +1436,43 @@ class FlashAttentionBackwardSm90:
                 n_block=n_block,
                 seqlen_info=seqlen,
             )
+            rel_bias_load_fn_cur = None
+            rel_bias_apply_fn_cur = None
+            if const_expr(self.has_rel_bias):
+                rel_bias_load_fn_cur = partial(
+                    self.load_rel_bias,
+                    sBias=sBias,
+                    mRelBias=mRelBias,
+                    mRelBiasParams=mRelBiasParams,
+                    tidx=tidx,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    n_block=n_block,
+                    seqlen_info=seqlen,
+                )
+                rel_bias_apply_fn_cur = partial(
+                    self.apply_rel_bias,
+                    thr_mma_SdP=thr_mma_SdP,
+                    sBias=sBias,
+                    mRelBiasParams=mRelBiasParams,
+                    softmax_scale=softmax_scale,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    n_block=n_block,
+                )
+            dbias_flush_fn_cur = None
+            if const_expr(self.has_dbias):
+                dbias_flush_fn_cur = partial(
+                    self.flush_dbias,
+                    sdS=sdS,
+                    mdBias=mdBias,
+                    mdBiasParams=mdBiasParams,
+                    tidx=tidx,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    n_block=n_block,
+                    seqlen_info=seqlen,
+                )
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
             if const_expr(not self.use_block_sparsity):
@@ -1425,7 +1515,11 @@ class FlashAttentionBackwardSm90:
                             mask_fn=mask_fn,
                             score_mod_fn=score_mod_fn_cur,
                             score_mod_bwd_fn=score_mod_bwd_fn_cur,
+                            dbias_flush_fn=dbias_flush_fn_cur,
+                            rel_bias_load_fn=rel_bias_load_fn_cur,
+                            rel_bias_apply_fn=rel_bias_apply_fn_cur,
                             dKV_accumulate=dKV_accumulate,
+                            is_last_m=m_block == m_block_max - 1,
                         )
                         dKV_accumulate = True
                 else:
@@ -1522,6 +1616,176 @@ class FlashAttentionBackwardSm90:
         return utils.shuffle_sync(tSrS[idx0 + idx1 * vecsize], offset=off * 4 + (lane % 4))
 
     @cute.jit
+    def load_rel_bias(
+        self,
+        m_block,
+        sBias: cute.Tensor,
+        mRelBias: cute.Tensor,
+        mRelBiasParams: cute.Tensor,
+        tidx: Int32,
+        batch_idx,
+        head_idx,
+        n_block,
+        seqlen_info: SeqlenInfoQK,
+    ):
+        """Cooperatively stage the tile's bias rows into smem with 16B vector copies.
+
+        The bias is additive in relative (distance) layout: flat = P0*b + P1*h +
+        P2*q + P3*kv + P4 with P3 == -1, so for a fixed q row the tile's tile_n
+        elements are CONTIGUOUS (descending in kv). Each row's window is fetched
+        from the 8-element-aligned floor of its minimum index; the reader
+        reconstructs the same alignment offset arithmetically. The caller must pad
+        the bias tensor so every window read is in bounds (tile_n elements of left
+        padding, rel_row_elems of right padding).
+
+        Thread mapping: 4 threads per q row, rel_row_elems/32 vector copies each;
+        consecutive threads fetch consecutive 16B chunks of the same row.
+        """
+        P0 = mRelBiasParams[0]
+        P1 = mRelBiasParams[1]
+        P2 = mRelBiasParams[2]
+        P4 = mRelBiasParams[4]
+        chunks_per_seg = cutlass.const_expr(self.rel_row_elems // 32)
+        copy_atom_128 = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), self.dtype, num_bits_per_copy=128
+        )
+        r = tidx // 4
+        seg = tidx % 4
+        # clamp: a speculative prefetch past the last m iteration must stay in
+        # bounds; rows past seqlen are seqlen-masked downstream anyway
+        q = cutlass.min(m_block * self.tile_m + r, seqlen_info.seqlen_q - 1)
+        kv_hi = n_block * self.tile_n + self.tile_n - 1
+        fmin = P0 * batch_idx + P1 * head_idx + P2 * q - kv_hi + P4
+        a0 = fmin - (fmin & 7)
+        for ch in cutlass.range(chunks_per_seg, unroll_full=True):
+            off = (seg * chunks_per_seg + ch) * 8
+            # Both sides are 16B aligned by contract -- a0 is 8-element aligned on a
+            # 16B-aligned bias tensor, and sBias rows are rel_row_elems (a multiple
+            # of 8) apart from a 1024B-aligned base -- but the pointer arithmetic
+            # erases that statically, so re-stamp the alignment assumption.
+            gsrc_ptr = cute.make_ptr(
+                self.dtype,
+                (mRelBias.iterator + a0 + off).toint(),
+                mRelBias.memspace,
+                assumed_align=16,
+            )
+            sdst_ptr = cute.make_ptr(
+                self.dtype,
+                (sBias.iterator + r * self.rel_row_elems + off).toint(),
+                sBias.memspace,
+                assumed_align=16,
+            )
+            gsrc = cute.make_tensor(gsrc_ptr, cute.make_layout(8))
+            sdst = cute.make_tensor(sdst_ptr, cute.make_layout(8))
+            cute.copy(copy_atom_128, gsrc, sdst)
+        # fire-and-forget: committed here, drained right before the visibility
+        # barrier at the apply site
+        cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def apply_rel_bias(
+        self,
+        acc_S: cute.Tensor,
+        m_block,
+        thr_mma_SdP: cute.ThrMma,
+        sBias: cute.Tensor,
+        mRelBiasParams: cute.Tensor,
+        softmax_scale,
+        batch_idx,
+        head_idx,
+        n_block,
+    ):
+        """acc_S = acc_S * softmax_scale + bias, bias read from the smem-staged tile.
+
+        Index math mirrors load_rel_bias: smem col = (fmin(q) mod 8) + (kv_hi - kv).
+        Reads out of the bias's logical support hit the caller's padding and are
+        masked to -inf downstream (application is premask), exactly like a premask
+        score modification.
+        """
+        cS = cute.make_identity_tensor(
+            (self.tile_n, self.tile_m) if self.SdP_swapAB else (self.tile_m, self.tile_n)
+        )
+        cS = cute.domain_offset(
+            (n_block * self.tile_n, m_block * self.tile_m)
+            if self.SdP_swapAB
+            else (m_block * self.tile_m, n_block * self.tile_n),
+            cS,
+        )
+        tScS = thr_mma_SdP.partition_C(cS)
+        if cutlass.const_expr(self.SdP_swapAB):
+            q_pos = cutlass.const_expr(1)
+            kv_pos = cutlass.const_expr(0)
+        else:
+            q_pos = cutlass.const_expr(0)
+            kv_pos = cutlass.const_expr(1)
+        P0 = mRelBiasParams[0]
+        P1 = mRelBiasParams[1]
+        P2 = mRelBiasParams[2]
+        P4 = mRelBiasParams[4]
+        kv_hi = n_block * self.tile_n + self.tile_n - 1
+        c1 = P0 * batch_idx + P1 * head_idx - kv_hi + P4
+        m0 = m_block * self.tile_m
+        n_vals = cutlass.const_expr(cute.size(acc_S.shape))
+        for i in cutlass.range(n_vals, unroll_full=True):
+            q = tScS[i][q_pos]
+            kv = tScS[i][kv_pos]
+            fmin = c1 + P2 * q
+            col = (fmin & 7) + (kv_hi - kv)
+            val = sBias[q - m0, col]
+            acc_S[i] = acc_S[i] * softmax_scale + cutlass.Float32(val)
+
+    @cute.jit
+    def flush_dbias(
+        self,
+        m_block,
+        smem_idx,
+        sdS: cute.Tensor,
+        mdBias: cute.Tensor,
+        mdBiasParams: cute.Tensor,
+        tidx: Int32,
+        batch_idx,
+        head_idx,
+        n_block,
+        seqlen_info: SeqlenInfoQK,
+    ):
+        """Emit the dS tile from smem as an additive-bias gradient.
+
+        mdBiasParams (Int32[9]) describes an affine flat index and a validity window:
+            flat = P0*b + P1*h + P2*q + P3*kv + P4, valid iff 0 <= P5*q + P6*kv + P7 < P8
+        Invalid lanes (outside the bias's support, or rows/cols beyond seqlen) are
+        diverted branchlessly to the dustbin slot -- mdBias's LAST element, which the
+        caller allocates and ignores. Each valid element has exactly one writer
+        (tiles are disjoint, the grid is per (batch, q-head)), so the store is
+        deterministic with no atomics. Values are the same converted dS the dQ/dK
+        GEMMs consume. Consecutive threads walk consecutive kv columns, so every
+        store instruction is a coalesced row stripe.
+        """
+        P0 = mdBiasParams[0]
+        P1 = mdBiasParams[1]
+        P2 = mdBiasParams[2]
+        P3 = mdBiasParams[3]
+        P4 = mdBiasParams[4]
+        P5 = mdBiasParams[5]
+        P6 = mdBiasParams[6]
+        P7 = mdBiasParams[7]
+        P8 = mdBiasParams[8]
+        dust = cute.size(mdBias.shape) - 1
+        rows_per_pass = cutlass.const_expr(self.num_mma_threads // self.tile_n)
+        c = tidx % self.tile_n
+        r0 = tidx // self.tile_n
+        kv = n_block * self.tile_n + c
+        base = P0 * batch_idx + P1 * head_idx + P3 * kv + P4
+        dcol = P6 * kv + P7
+        kv_ok = kv < seqlen_info.seqlen_k
+        for k in cutlass.range(self.tile_m // rows_per_pass, unroll=4):
+            r = r0 + k * rows_per_pass
+            q = m_block * self.tile_m + r
+            d = P5 * q + dcol
+            ok = kv_ok & (d >= 0) & (d < P8) & (q < seqlen_info.seqlen_q)
+            tgt = cutlass.Int32(cutlass.select_(ok, base + P2 * q, dust))
+            mdBias[tgt] = sdS[r, c, smem_idx]
+
+    @cute.jit
     def mma_one_m_block(
         self,
         m_block: Int32,
@@ -1546,7 +1810,11 @@ class FlashAttentionBackwardSm90:
         mask_fn: Optional[Callable] = None,
         score_mod_fn: Optional[Callable] = None,
         score_mod_bwd_fn: Optional[Callable] = None,
+        dbias_flush_fn: Optional[Callable] = None,
+        rel_bias_load_fn: Optional[Callable] = None,
+        rel_bias_apply_fn: Optional[Callable] = None,
         dKV_accumulate: Boolean = True,
+        is_last_m: Boolean = True,
     ):
         consumer_state_dO_cur = (
             consumer_state_Q if const_expr(self.Q_stage == self.dO_stage) else consumer_state_dO
@@ -1557,6 +1825,14 @@ class FlashAttentionBackwardSm90:
         # (1) [GEMM 1] S = Q @ K^T
         pipeline_Q.consumer_wait(consumer_state_Q, pipeline_Q.consumer_try_wait(consumer_state_Q))
         acc_S = mma_qk_fn(A_idx=smem_idx_Q, wg_wait=-1)
+        if const_expr(rel_bias_load_fn is not None):
+            # Pipeline warm-up: only a tile's FIRST m iteration loads its own bias
+            # rows here (one exposed load per (n_block, head) tile). Every later
+            # iteration's rows were prefetched right after the previous apply, a
+            # full GEMM round earlier.
+            if not dKV_accumulate:
+                rel_bias_load_fn(m_block=m_block)
+                cute.arch.cp_async_commit_group()
         # If shuffle_LSE, OOB reads are OK since sLSE is already padded
         tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, smem_idx_Q])
         # (2) [GEMM 2] dP = dO @ V.T
@@ -1572,6 +1848,19 @@ class FlashAttentionBackwardSm90:
 
         if const_expr(self.score_mod is not None):
             score_mod_fn(acc_S, m_block=m_block)
+
+        if const_expr(rel_bias_apply_fn is not None):
+            # drain the buffer's cp.async group, make it visible tile-wide, apply,
+            # then -- once every thread is done reading -- start the NEXT iteration's
+            # prefetch so its DRAM latency hides behind the rest of this iteration.
+            cute.arch.cp_async_wait_group(0)
+            PdS_barrier.arrive_and_wait()
+            rel_bias_apply_fn(acc_S, m_block=m_block)
+            PdS_barrier.arrive_and_wait()
+            rel_bias_load_fn(m_block=m_block + 1)
+            cute.arch.cp_async_commit_group()
+
+
 
         # (3) [Pointwise 1] P = exp(S - LSE)
         if cutlass.const_expr(mask_fn is not None):
@@ -1677,6 +1966,12 @@ class FlashAttentionBackwardSm90:
             pipeline_dO.consumer_release(consumer_state_dO_cur)
             warpgroup.wait_group(0)
             pipeline_Q.consumer_release(consumer_state_Q)
+
+        if const_expr(dbias_flush_fn is not None):
+            # After wait_group(0): the dQ/dK GEMMs that read sdS have drained and
+            # every heavy fragment is retired -- the flush's smem reads and gmem
+            # stores cannot interleave with any load window here.
+            dbias_flush_fn(m_block=m_block, smem_idx=smem_idx_PdS)
 
         consumer_state_Q.advance()
         consumer_state_dO.advance()
