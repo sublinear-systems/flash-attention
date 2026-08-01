@@ -779,21 +779,24 @@ class FlashAttentionBackwardSm90:
         pipeline_Bias = None
         if const_expr(self.has_rel_bias):
             # producer = the 64 threads of producer warps 2..3 (each issues its own
-            # cp.asyncs and arrives at commit); every consumer thread arrives at
-            # release
+            # cp.asyncs and arrives at commit); consumers release via per-warp
+            # elected arrives
             bias_producer_group = cutlass.pipeline.CooperativeGroup(
                 cutlass.pipeline.Agent.Thread, 64
             )
             bias_consumer_group = cutlass.pipeline.CooperativeGroup(
-                cutlass.pipeline.Agent.Thread, self.num_mma_threads
+                cutlass.pipeline.Agent.Thread,
+                self.num_mma_threads // cute.arch.WARP_SIZE,
             )
             pipeline_Bias = pipeline.PipelineCpAsync.create(
                 barrier_storage=storage.mbar_ptr_Bias.data_ptr(),
                 num_stages=self.rel_bias_stage,
                 producer_group=bias_producer_group,
                 consumer_group=bias_consumer_group,
-                # every consumer thread arrives at release (group counts threads)
-                elect_one_release=False,
+                # per-warp elected release arrives (same shape as the Q/dO
+                # pipelines): 256 per-thread arrives per iteration serialize on
+                # the mbarrier and sit on the consumer critical path
+                elect_one_release=True,
                 defer_sync=True,
             )
         # A dedicated flusher warp (via this dS handoff pipeline) was measured at
@@ -1995,8 +1998,14 @@ class FlashAttentionBackwardSm90:
             q = m_block * self.tile_m + r
             d = P5 * q + dcol
             ok = kv_ok & (d >= 0) & (d < P8) & (q < seqlen_info.seqlen_q)
-            tgt = cutlass.Int32(cutlass.select_(ok, base + P2 * q, dust))
-            mdBias[tgt] = sdS[r, c, smem_idx]
+            val = sdS[r, c, smem_idx]
+            # predicated store, no dustbin: out-of-band lanes previously stored to
+            # a single shared dust address, and same-address stores from many warps
+            # serialize on one L2 slice (measured: an all-dust flush is ~2.5x
+            # slower than the real scatter). The dust slot stays in the contract
+            # for the callback path; the structural flush simply skips the store.
+            if ok:
+                mdBias[cutlass.Int32(base + P2 * q)] = val
 
     @cute.jit
     def mma_one_m_block(
