@@ -1053,7 +1053,13 @@ class FlashAttentionBackwardSm90:
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
-            qhead_per_kvhead=self.qhead_per_kvhead,
+            # The backward never runs Pack-GQA (the entry point forces pack_gqa=False),
+            # so q_idx is a plain query index and head_idx is a plain query-head index.
+            # Passing qhead_per_kvhead here would make the inner helper apply the
+            # Pack-GQA unpacking transform to unpacked indices, handing score mods
+            # q_idx // qhead_per_kvhead and head_idx * qhead_per_kvhead + q_idx %
+            # qhead_per_kvhead instead of the real coordinates.
+            qhead_per_kvhead=1,
             transpose_indices=self.SdP_swapAB,
         )
 
@@ -1097,7 +1103,13 @@ class FlashAttentionBackwardSm90:
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
-            qhead_per_kvhead=self.qhead_per_kvhead,
+            # The backward never runs Pack-GQA (the entry point forces pack_gqa=False),
+            # so q_idx is a plain query index and head_idx is a plain query-head index.
+            # Passing qhead_per_kvhead here would make the inner helper apply the
+            # Pack-GQA unpacking transform to unpacked indices, handing score mods
+            # q_idx // qhead_per_kvhead and head_idx * qhead_per_kvhead + q_idx %
+            # qhead_per_kvhead instead of the real coordinates.
+            qhead_per_kvhead=1,
             transpose_indices=self.SdP_swapAB,
         )
 
