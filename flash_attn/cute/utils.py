@@ -19,7 +19,7 @@ from cutlass.cute.runtime import from_dlpack
 
 import quack.activation
 
-_MIXER_ATTRS = ("__vec_size__",)
+_MIXER_ATTRS = ("__vec_size__", "__bwd_vec_size__")
 
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);

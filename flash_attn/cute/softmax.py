@@ -553,6 +553,11 @@ def apply_score_mod_bwd_inner(
         q_idx_pos = cutlass.const_expr(0)
         kv_idx_pos = cutlass.const_expr(1)
     n_vals = cutlass.const_expr(cute.size(grad_tensor.shape))
+    if cutlass.const_expr(n_vals % vec_size != 0):
+        raise ValueError(
+            f"score_mod_bwd vec_size {vec_size} must divide the accumulator fragment "
+            f"size {n_vals}"
+        )
     grad_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
     score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
     kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)

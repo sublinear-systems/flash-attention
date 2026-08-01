@@ -1131,6 +1131,102 @@ def test_cute_vs_flex_attention_backward_with_aux(
     assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
+@cute.jit
+def score_mod_per_lane_scale(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Per-lane aux read: each lane uses its OWN (head_idx, q_idx).
+
+    This is the access class `__bwd_vec_size__` is for -- unlike the _vectorized mods,
+    it makes no assumption that the lanes of one call share a row or are adjacent in kv,
+    so it stays correct whatever the accumulator's ownership pattern is.
+    """
+    scale = aux_tensors[0]  # [num_heads, seqlen_q]
+    n = cutlass.const_expr(cute.size(tSrS_ssa.shape))
+    h_frag = cute.make_rmem_tensor(n, cutlass.Int32)
+    h_frag.store(h_idx)
+    q_frag = cute.make_rmem_tensor(n, cutlass.Int32)
+    q_frag.store(q_idx)
+    val_frag = cute.make_rmem_tensor(n, scale.element_type)
+    for i in cutlass.range(n, unroll_full=True):
+        val_frag[i] = scale[h_frag[i], q_frag[i]]
+    return tSrS_ssa * (1.0 + (val_frag.load()).to(cutlass.Float32))
+
+
+@cute.jit
+def score_mod_bwd_per_lane_scale(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Joint graph of score_mod_per_lane_scale: d(score * (1 + s)) / d score = 1 + s."""
+    scale = aux_tensors[0]
+    n = cutlass.const_expr(cute.size(grad.shape))
+    h_frag = cute.make_rmem_tensor(n, cutlass.Int32)
+    h_frag.store(h_idx)
+    q_frag = cute.make_rmem_tensor(n, cutlass.Int32)
+    q_frag.store(q_idx)
+    val_frag = cute.make_rmem_tensor(n, scale.element_type)
+    for i in cutlass.range(n, unroll_full=True):
+        val_frag[i] = scale[h_frag[i], q_frag[i]]
+    return grad * (1.0 + (val_frag.load()).to(cutlass.Float32))
+
+
+@pytest.mark.parametrize("bwd_vec_size", [2, 4])
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (256, 128)])
+@pytest.mark.parametrize("dim", [128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_score_mod_bwd_vec_size(bwd_vec_size, seqlen_q, seqlen_kv, dim, dtype):
+    """__bwd_vec_size__ only batches SSA ops: grads must not depend on its value.
+
+    Reference is the default width (1 for aux-reading mods). dK/dV accumulate in a fixed
+    order within a tile and must match bitwise; dQ goes through the fp32 dQaccum whose
+    cross-tile order is not pinned unless deterministic=True, so it is compared with a
+    tight tolerance. The widest case is also checked against the flex reference so the
+    batched path is pinned to real values, not only to itself.
+    """
+    torch.random.manual_seed(42)
+    num_heads = 4
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_heads, dim=dim, dtype=dtype
+    )
+    scale_t = torch.randn(num_heads, seqlen_q, device="cuda", dtype=dtype) * 0.2
+    aux_tensors = [scale_t]
+
+    def eager_ref(score, b, h, q_idx, kv_idx):
+        return score * (1.0 + scale_t.to(score.dtype)[h, q_idx])
+
+    def run(width):
+        for fn in (score_mod_per_lane_scale, score_mod_bwd_per_lane_scale):
+            if width is None:
+                if hasattr(fn, "__bwd_vec_size__"):
+                    del fn.__bwd_vec_size__
+            else:
+                fn.__bwd_vec_size__ = width
+        torch.random.manual_seed(7)
+        return run_cute_flash_bwd(
+            q, k, v, score_mod_per_lane_scale, score_mod_bwd_per_lane_scale,
+            aux_tensors=aux_tensors,
+        )
+
+    try:
+        _, grad_out, dq_ref, dk_ref, dv_ref = run(None)
+        _, _, dq, dk, dv = run(bwd_vec_size)
+    finally:
+        for fn in (score_mod_per_lane_scale, score_mod_bwd_per_lane_scale):
+            if hasattr(fn, "__bwd_vec_size__"):
+                del fn.__bwd_vec_size__
+
+    assert torch.equal(dk, dk_ref), f"dK differs at __bwd_vec_size__={bwd_vec_size}"
+    assert torch.equal(dv, dv_ref), f"dV differs at __bwd_vec_size__={bwd_vec_size}"
+    torch.testing.assert_close(dq, dq_ref, rtol=1e-3, atol=1e-3)
+
+    if bwd_vec_size == 4:
+        _, dq_flex, dk_flex, dv_flex = run_flex_reference_bwd(
+            q, k, v, eager_ref, grad_out, dtype=torch.float32
+        )
+        for name, got, ref in (("dQ", dq, dq_flex), ("dK", dk, dk_flex), ("dV", dv, dv_flex)):
+            atol = 4 * (ref + 0.3 - 0.3 - ref).abs().max().item() + 2e-2
+            err = (got - ref.to(dtype)).abs().max().item()
+            assert err <= atol, f"{name} vs flex too large: {err:.2e} > {atol:.2e}"
+
+
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (256, 128)])
 @pytest.mark.parametrize("dim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
