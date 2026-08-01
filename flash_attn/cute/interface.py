@@ -239,6 +239,12 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
 
 
 
+# Trailing scratch elements a flat `dbias` tensor must carry: the SM90 backward
+# diverts out-of-support lanes into this tail region branchlessly, striped per
+# CTA so no cache line is shared by many concurrent tiles.
+DBIAS_TAIL_PAD = 4096
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -1720,10 +1726,11 @@ def _flash_attn_bwd(
     if aux_tensors is not None:
         cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
-    # Additive-bias gradient sink: the dS tile is flushed from smem to `dbias` after
-    # the dQ/dK GEMMs drain. dbias is FLAT with one trailing dustbin element the
-    # caller ignores; dbias_coeffs = 9 ints (affine flat index + validity window),
-    # see FlashAttentionBackwardSm90.flush_dbias.
+    # Additive-bias gradient sink: the converted dS fragment is stored straight
+    # from registers to `dbias`. dbias is FLAT with DBIAS_TAIL_PAD trailing
+    # scratch elements the caller ignores (out-of-support lanes are diverted
+    # there); dbias_coeffs = 9 ints (affine flat index + validity window), see
+    # FlashAttentionBackwardSm90.flush_dbias.
     dbias_params = None
     if dbias is not None:
         assert arch // 10 == 9, "dbias flush is only implemented in the SM90 backward"

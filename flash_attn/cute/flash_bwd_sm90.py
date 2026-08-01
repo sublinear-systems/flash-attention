@@ -1749,16 +1749,28 @@ class FlashAttentionBackwardSm90:
         the alignment offset arithmetically. The caller pads the bias tensor so
         every window read is in bounds.
 
-        Thread mapping: 32 threads walk row-major (row, chunk) pairs -- consecutive
-        threads fetch consecutive 8B chunks, coalesced within each row.
+        Thread mapping: 8 lanes per q row (8 rows per pass across the two warps),
+        each lane loading strided 8B chunks of its row at static offsets. The
+        row-level arithmetic is unrolled once per pass and the intra-row loads
+        stay warp-coalesced (a lane-group's 8 chunks are 64B contiguous). One
+        row per THREAD minimizes instructions but makes every LDGSTS touch 32
+        different rows (32 lines per instruction) -- measured copy cost tracks
+        that transaction count, not the instruction count. The row-major
+        (row, chunk) walk on the other extreme re-derives the row math per 8B
+        chunk (~10x the instructions) on a 24-register warp.
         """
         chunks_per_row = cutlass.const_expr(self.rel_row_elems // 4)
-        n_chunks = cutlass.const_expr(self.tile_m * chunks_per_row)
-        passes = cutlass.const_expr((n_chunks + 63) // 64)
+        lanes_per_row = cutlass.const_expr(8)
+        chunks_per_lane = cutlass.const_expr(
+            (chunks_per_row + lanes_per_row - 1) // lanes_per_row
+        )
+        rows_per_pass = cutlass.const_expr(64 // lanes_per_row)
         copy_atom_64 = cute.make_copy_atom(
             cpasync.CopyG2SOp(), self.dtype, num_bits_per_copy=64
         )
         tidx = cute.arch.thread_idx()[0] - 64  # producer warps 2..3 -> [0, 64)
+        lane_r = tidx // lanes_per_row  # row slot within a pass
+        lane_c = tidx % lanes_per_row
         P0 = mRelBiasParams[0]
         P1 = mRelBiasParams[1]
         P2 = mRelBiasParams[2]
@@ -1786,33 +1798,41 @@ class FlashAttentionBackwardSm90:
                     pipeline_Bias.producer_acquire(producer_state)
                     buf = producer_state.index
                     sbase = sBias.iterator + buf * (self.tile_m * self.rel_row_elems)
-                    for k in cutlass.range(passes, unroll=1):
-                        g = tidx + k * 64
-                        if g < n_chunks:
-                            r = g // chunks_per_row
-                            ch = g - r * chunks_per_row
+                    for k in cutlass.range_constexpr(
+                        (self.tile_m + rows_per_pass - 1) // rows_per_pass
+                    ):
+                        r = lane_r + k * rows_per_pass
+                        if const_expr(self.tile_m % rows_per_pass == 0) or r < self.tile_m:
                             q = cutlass.min(
                                 m_block * self.tile_m + r, seqlen.seqlen_q - 1
                             )
                             fmin = c1 + P2 * q
                             a0 = fmin - (fmin & 3)
-                            gsrc_ptr = cute.make_ptr(
-                                self.dtype,
-                                (mRelBias.iterator + a0 + ch * 4).toint(),
-                                mRelBias.memspace,
-                                assumed_align=8,
-                            )
-                            sdst_ptr = cute.make_ptr(
-                                self.dtype,
-                                (sbase + r * self.rel_row_elems + ch * 4).toint(),
-                                sBias.memspace,
-                                assumed_align=8,
-                            )
-                            cute.copy(
-                                copy_atom_64,
-                                cute.make_tensor(gsrc_ptr, cute.make_layout(4)),
-                                cute.make_tensor(sdst_ptr, cute.make_layout(4)),
-                            )
+                            gbase = mRelBias.iterator + a0
+                            srow = sbase + r * self.rel_row_elems
+                            for j in cutlass.range_constexpr(chunks_per_lane):
+                                # clamp the tail chunk instead of predicating it:
+                                # duplicate same-src/same-dst cp.asyncs are benign
+                                ch = cutlass.min(
+                                    lane_c + j * lanes_per_row, chunks_per_row - 1
+                                )
+                                gsrc_ptr = cute.make_ptr(
+                                    self.dtype,
+                                    (gbase + ch * 4).toint(),
+                                    mRelBias.memspace,
+                                    assumed_align=8,
+                                )
+                                sdst_ptr = cute.make_ptr(
+                                    self.dtype,
+                                    (srow + ch * 4).toint(),
+                                    sBias.memspace,
+                                    assumed_align=8,
+                                )
+                                cute.copy(
+                                    copy_atom_64,
+                                    cute.make_tensor(gsrc_ptr, cute.make_layout(4)),
+                                    cute.make_tensor(sdst_ptr, cute.make_layout(4)),
+                                )
                     # cp.async completion arrive: orders the async-proxy smem
                     # writes for the consumers' acquire, which a plain arrive after
                     # a wait_group does NOT (async->generic proxy visibility)
@@ -1969,12 +1989,19 @@ class FlashAttentionBackwardSm90:
         mdBiasParams (Int32[9]) describes an affine flat index and a validity window:
             flat = P0*b + P1*h + P2*q + P3*kv + P4, valid iff 0 <= P5*q + P6*kv + P7 < P8
         Invalid lanes (outside the bias's support, or rows/cols beyond seqlen) are
-        diverted branchlessly to the dustbin slot -- mdBias's LAST element, which the
-        caller allocates and ignores. Each valid element has exactly one writer
-        (tiles are disjoint, the grid is per (batch, q-head)), so the store is
-        deterministic with no atomics. Values are the same converted dS the dQ/dK
-        GEMMs consume. Consecutive threads walk consecutive kv columns, so every
-        store instruction is a coalesced row stripe.
+        diverted branchlessly to per-column slots of the 4096-element dust REGION
+        at the tail of mdBias (interface.DBIAS_TAIL_PAD), which the caller
+        allocates and ignores. Branchless is deliberate: any dynamic `if` around
+        the store makes the compiler sink the smem read into the branch and
+        re-derive the swizzled address per element (~2x wall). Per-column dust
+        slots are deliberate too: a single shared dust element serializes
+        same-address stores from every warp on one L2 slice.
+
+        Each valid element has exactly one writer (tiles are disjoint, the grid
+        is per (batch, q-head)), so the store is deterministic with no atomics;
+        dust-region contents are scratch. Values are the same converted dS the
+        dQ/dK GEMMs consume. Consecutive threads walk consecutive kv columns, so
+        every store instruction is a coalesced row stripe.
         """
         P0 = mdBiasParams[0]
         P1 = mdBiasParams[1]
@@ -1985,7 +2012,7 @@ class FlashAttentionBackwardSm90:
         P6 = mdBiasParams[6]
         P7 = mdBiasParams[7]
         P8 = mdBiasParams[8]
-        dust = cute.size(mdBias.shape) - 1
+        dust0 = cute.size(mdBias.shape) - 4096  # DBIAS_TAIL_PAD scratch region
         rows_per_pass = cutlass.const_expr(self.num_mma_threads // self.tile_n)
         c = tidx % self.tile_n
         r0 = tidx // self.tile_n
@@ -1993,20 +2020,17 @@ class FlashAttentionBackwardSm90:
         base = P0 * batch_idx + P1 * head_idx + P3 * kv + P4
         dcol = P6 * kv + P7
         kv_ok = kv < seqlen_info.seqlen_k
+        # stripe the dust region per CTA: a 128-element (2-line) region shared by
+        # every tile's edge rows re-creates the same-line store serialization the
+        # region exists to avoid
+        dustc = dust0 + ((n_block + head_idx) & 31) * 128 + c
         for k in cutlass.range(self.tile_m // rows_per_pass, unroll=4):
             r = r0 + k * rows_per_pass
             q = m_block * self.tile_m + r
             d = P5 * q + dcol
             ok = kv_ok & (d >= 0) & (d < P8) & (q < seqlen_info.seqlen_q)
-            val = sdS[r, c, smem_idx]
-            # predicated store, no dustbin: out-of-band lanes previously stored to
-            # a single shared dust address, and same-address stores from many warps
-            # serialize on one L2 slice (measured: an all-dust flush is ~2.5x
-            # slower than the real scatter). The dust slot stays in the contract
-            # for the callback path; the structural flush simply skips the store.
-            if ok:
-                mdBias[cutlass.Int32(base + P2 * q)] = val
-
+            tgt = cutlass.Int32(cutlass.select_(ok, base + P2 * q, dustc))
+            mdBias[tgt] = sdS[r, c, smem_idx]
     @cute.jit
     def mma_one_m_block(
         self,
@@ -2052,6 +2076,7 @@ class FlashAttentionBackwardSm90:
         acc_S = mma_qk_fn(A_idx=smem_idx_Q, wg_wait=-1)
         # If shuffle_LSE, OOB reads are OK since sLSE is already padded
         tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, smem_idx_Q])
+
         # (2) [GEMM 2] dP = dO @ V.T
         pipeline_dO.consumer_wait(
             consumer_state_dO_cur, pipeline_dO.consumer_try_wait(consumer_state_dO_cur)
@@ -2194,7 +2219,10 @@ class FlashAttentionBackwardSm90:
             pipeline_Q.consumer_release(consumer_state_Q)
 
         if const_expr(dbias_flush_fn is not None and pipeline_dS is None):
-            # no flusher warp: drained-bottom flush, the only spill-safe MMA-side home
+            # Drained-bottom flush from the smem dS tile. Register-source
+            # emission (from tdKrdS) was measured worse: the accumulator
+            # fragment's lanes scatter each store instruction over four q-groups,
+            # while the r2s'd tile gives contiguous descending row stripes.
             dbias_flush_fn(m_block=m_block, smem_idx=smem_idx_PdS)
 
         consumer_state_Q.advance()

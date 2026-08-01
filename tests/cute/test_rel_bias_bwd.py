@@ -14,7 +14,7 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
-from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
+from flash_attn.cute.interface import DBIAS_TAIL_PAD, _flash_attn_bwd, _flash_attn_fwd
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
@@ -92,7 +92,11 @@ def _run_structural(q, k, v, rel, dout, out, lse, kw, deterministic=False, canar
     rel_padded = torch.nn.functional.pad(rel, (PAD_L, PAD_R)).view(-1)
     Wp = PAD_L + W + PAD_R
     fill = float("nan") if canary else 0.0
-    dbias = torch.full((B * S * H * W + 1,), fill, device=rel.device, dtype=rel.dtype)
+    # DBIAS_TAIL_PAD trailing scratch elements: the flush diverts out-of-support
+    # lanes there (contents are scratch and NOT deterministic -- always slice)
+    dbias = torch.full(
+        (B * S * H * W + DBIAS_TAIL_PAD,), fill, device=rel.device, dtype=rel.dtype
+    )
     dq, dk, dv = _flash_attn_bwd(
         q, k, v, out, dout, lse, deterministic=deterministic,
         rel_bias=rel_padded, rel_bias_coeffs=_coeffs(S, H, W, Wp, rel.device, True),
@@ -119,8 +123,9 @@ def test_structural_matches_callbacks():
     torch.testing.assert_close(dq_a, dq_b, rtol=1e-2, atol=1e-2)
     # the structural dbias is the f16-converted dS the GEMMs consume; the callback
     # path scattered fp32 dS -- equal up to that one rounding
+    N = B * S * H * W
     torch.testing.assert_close(
-        dbias_b[:-1].float(), dbias_ref[:-1], rtol=1e-2, atol=1e-2
+        dbias_b[:N].float(), dbias_ref[:N], rtol=1e-2, atol=1e-2
     )
 
 
@@ -128,7 +133,7 @@ def test_structural_store_coverage():
     q, k, v, rel, dout, out, lse, kw, _, _ = _setup()
     B, S, H, W = rel.shape
     _, _, _, dbias = _run_structural(q, k, v, rel, dout, out, lse, kw, canary=True)
-    written = ~torch.isnan(dbias[:-1].view(B, S, H, W).float())
+    written = ~torch.isnan(dbias[: B * S * H * W].view(B, S, H, W).float())
     valid = (torch.arange(W, device=rel.device)[None, :]
              <= torch.arange(S, device=rel.device)[:, None])[None, :, None, :]
     assert bool((written == valid).all()), (
@@ -139,9 +144,11 @@ def test_structural_store_coverage():
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_structural_bitwise_dbias(deterministic):
     q, k, v, rel, dout, out, lse, kw, _, _ = _setup(seed=3)
+    B, S, H, W = rel.shape
     r1 = _run_structural(q, k, v, rel, dout, out, lse, kw, deterministic=deterministic)
     r2 = _run_structural(q, k, v, rel, dout, out, lse, kw, deterministic=deterministic)
-    assert torch.equal(r1[3], r2[3]), "dbias must be run-to-run bitwise"
+    N = B * S * H * W
+    assert torch.equal(r1[3][:N], r2[3][:N]), "dbias must be run-to-run bitwise"
     if deterministic:
         # with the flag, the whole backward is bitwise (dK/dV semaphore-ordered
         # across q heads, dQ accumulation ordered)
