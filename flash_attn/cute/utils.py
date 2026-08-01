@@ -19,7 +19,7 @@ from cutlass.cute.runtime import from_dlpack
 
 import quack.activation
 
-_MIXER_ATTRS = ("__vec_size__", "__bwd_vec_size__")
+_MIXER_ATTRS = ("__vec_size__", "__bwd_vec_size__", "__needs_scores__")
 
 
 class AuxData(NamedTuple):

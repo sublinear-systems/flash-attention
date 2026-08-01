@@ -1247,6 +1247,84 @@ def test_cute_score_mod_bwd_vec_size(bwd_vec_size, seqlen_q, seqlen_kv, dim, dty
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (256, 128)])
 @pytest.mark.parametrize("dim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_score_mod_bwd_needs_scores_opt_out(seqlen_q, seqlen_kv, dim, dtype):
+    """__needs_scores__ = False must not change results for a mod that ignores scores.
+
+    score_mod_per_lane_scale's joint graph is (1 + s) * grad -- no dependence on the
+    pre-mod score -- so opting out of staging the score tile has to be a pure
+    subtraction of work. Reference is the default (score tile staged).
+    """
+    torch.random.manual_seed(42)
+    num_heads = 4
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_heads, dim=dim, dtype=dtype
+    )
+    scale_t = torch.randn(num_heads, seqlen_q, device="cuda", dtype=dtype) * 0.2
+
+    def run(opt_out):
+        fn = score_mod_bwd_per_lane_scale
+        if opt_out:
+            fn.__needs_scores__ = False
+        elif hasattr(fn, "__needs_scores__"):
+            del fn.__needs_scores__
+        torch.random.manual_seed(7)
+        return run_cute_flash_bwd(
+            q, k, v, score_mod_per_lane_scale, fn, aux_tensors=[scale_t]
+        )
+
+    try:
+        _, _, dq_ref, dk_ref, dv_ref = run(False)
+        _, _, dq, dk, dv = run(True)
+    finally:
+        if hasattr(score_mod_bwd_per_lane_scale, "__needs_scores__"):
+            del score_mod_bwd_per_lane_scale.__needs_scores__
+
+    assert torch.equal(dk, dk_ref), "dK changed under __needs_scores__ = False"
+    assert torch.equal(dv, dv_ref), "dV changed under __needs_scores__ = False"
+    torch.testing.assert_close(dq, dq_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (256, 128)])
+@pytest.mark.parametrize("dim", [128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_score_mod_bwd_scores_staged_by_default(seqlen_q, seqlen_kv, dim, dtype):
+    """The pre-mod score tile must still reach the joint graph unless opted out.
+
+    score_mod_squared's joint graph is 2 * score * grad, so it is only correct when the
+    score tile is staged (test_cute_vs_flex_attention_backward pins that against flex).
+    Here the same mod is run with __needs_scores__ = False, which hands it zeros: the
+    grads MUST change. If they did not, the staging would have quietly become dead code
+    and the opt-out would be doing nothing.
+    """
+    torch.random.manual_seed(42)
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=dim, dtype=dtype
+    )
+    assert not hasattr(score_mod_bwd_squared, "__needs_scores__")
+
+    def run():
+        torch.random.manual_seed(7)
+        return run_cute_flash_bwd(q, k, v, score_mod_squared, score_mod_bwd_squared)
+
+    try:
+        _, _, dq_staged, dk_staged, dv_staged = run()
+        score_mod_bwd_squared.__needs_scores__ = False
+        _, _, dq_zeros, dk_zeros, dv_zeros = run()
+    finally:
+        if hasattr(score_mod_bwd_squared, "__needs_scores__"):
+            del score_mod_bwd_squared.__needs_scores__
+
+    assert not torch.allclose(dq_zeros, dq_staged, rtol=1e-2, atol=1e-2), (
+        "dQ unchanged when the joint graph was fed zeros instead of the score tile"
+    )
+    assert not torch.allclose(dk_zeros, dk_staged, rtol=1e-2, atol=1e-2), (
+        "dK unchanged when the joint graph was fed zeros instead of the score tile"
+    )
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (256, 128)])
+@pytest.mark.parametrize("dim", [128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2), (2, 4)])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
 def test_cute_vs_flex_attention_backward_with_aux_gqa(
