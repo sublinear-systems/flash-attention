@@ -1778,6 +1778,19 @@ class FlashAttentionBackwardSm90:
         # bias tensors are kernel inputs: under programmatic dependent launch they
         # may still be written by the previous kernel at this point
         cute.arch.griddepcontrol_wait()
+        # Global read bound. The m-range is tile_m-rounded (get_m_block_min_max), so a
+        # visited row's window start reaches d = q - kv_hi up to blk + tile_m - 2 —
+        # fully-masked rows staged unconditionally — and the row read extends another
+        # tile_n + 3 elements. For the last rows of the last head that overruns the
+        # caller's right pad and, when the pad is thin, THE ALLOCATION (illegal read
+        # whenever the segment is tight; compute-sanitizer receipt in the commit).
+        # Clamp each chunk's SOURCE to the last aligned chunk: a clamped chunk holds
+        # only masked lanes (in-band flat indices end a full right-pad before the
+        # tensor does), so staged in-band values are unchanged; duplicate/garbage
+        # dust in masked slots was already the contract.
+        gmax = cute.size(mRelBias.shape) - 4
+        gmax = gmax - (gmax & 3)
+        gend = (mRelBias.iterator + gmax).toint()
         producer_state = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.rel_bias_stage
         )
@@ -1818,7 +1831,7 @@ class FlashAttentionBackwardSm90:
                                 )
                                 gsrc_ptr = cute.make_ptr(
                                     self.dtype,
-                                    (gbase + ch * 4).toint(),
+                                    cutlass.min((gbase + ch * 4).toint(), gend),
                                     mRelBias.memspace,
                                     assumed_align=8,
                                 )
