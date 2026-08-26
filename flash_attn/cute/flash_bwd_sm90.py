@@ -1774,7 +1774,12 @@ class FlashAttentionBackwardSm90:
         P0 = mRelBiasParams[0]
         P1 = mRelBiasParams[1]
         P2 = mRelBiasParams[2]
+        P3 = mRelBiasParams[3]
         P4 = mRelBiasParams[4]
+        P5 = mRelBiasParams[5]
+        P6 = mRelBiasParams[6]
+        P7 = mRelBiasParams[7]
+        P8 = mRelBiasParams[8]
         # bias tensors are kernel inputs: under programmatic dependent launch they
         # may still be written by the previous kernel at this point
         cute.arch.griddepcontrol_wait()
@@ -1805,6 +1810,7 @@ class FlashAttentionBackwardSm90:
                 or m_block_min < m_block_max
             )
             if process_tile:
+                kv_lo = n_block * self.tile_n
                 kv_hi = n_block * self.tile_n + self.tile_n - 1
                 c1 = P0 * batch_idx + P1 * head_idx - kv_hi + P4
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
@@ -1821,7 +1827,24 @@ class FlashAttentionBackwardSm90:
                             )
                             fmin = c1 + P2 * q
                             a0 = fmin - (fmin & 3)
-                            gbase = mRelBias.iterator + a0
+                            d0 = P5 * q + P6 * kv_lo + P7
+                            d1 = P5 * q + P6 * kv_hi + P7
+                            dmin = cutlass.min(d0, d1)
+                            dmax = cutlass.max(d0, d1)
+                            # Fully out-of-support rows use the caller's aligned
+                            # left-zero guard. Boundary rows retain the ordinary
+                            # affine load; their few invalid lanes land in the
+                            # fixed left/right guards and are already zero.
+                            zero_row = (
+                                P0 * batch_idx
+                                + P1 * head_idx
+                                + (P2 + P3) * q
+                            )
+                            gbase = cutlass.select_(
+                                (dmax >= 0) & (dmin < P8),
+                                a0,
+                                zero_row,
+                            )
                             srow = sbase + r * self.rel_row_elems
                             for j in cutlass.range_constexpr(chunks_per_lane):
                                 # clamp the tail chunk instead of predicating it:
@@ -1831,7 +1854,10 @@ class FlashAttentionBackwardSm90:
                                 )
                                 gsrc_ptr = cute.make_ptr(
                                     self.dtype,
-                                    cutlass.min((gbase + ch * 4).toint(), gend),
+                                    cutlass.min(
+                                        (mRelBias.iterator + gbase + ch * 4).toint(),
+                                        gend,
+                                    ),
                                     mRelBias.memspace,
                                     assumed_align=8,
                                 )

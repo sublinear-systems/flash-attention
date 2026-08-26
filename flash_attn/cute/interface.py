@@ -243,6 +243,10 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
 # diverts out-of-support lanes into this tail region branchlessly, striped per
 # CTA so no cache line is shared by many concurrent tiles.
 DBIAS_TAIL_PAD = 4096
+# This wheel masks structural rel_bias values outside the logical support encoded
+# by rel_bias_coeffs[5:9]. Callers can therefore keep only the fixed staging guard
+# instead of materializing zeros out to the full causal distance.
+REL_BIAS_SUPPORT_MASKED = True
 
 
 def maybe_contiguous(x):

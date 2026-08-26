@@ -36,8 +36,10 @@ def _make_mods(W, S, H):
         for i in cutlass.range(n, unroll_full=True):
             qi = q_idx[i]
             d = qi - kv_idx[i]
-            d = cutlass.max(cutlass.min(d, W - 1), 0)
-            vf[i] = rel[base + qi * (H * W) + d]
+            dc = cutlass.max(cutlass.min(d, W - 1), 0)
+            vf[i] = rel[base + qi * (H * W) + dc]
+            if (d < 0) | (d >= W):
+                vf[i] = cutlass.BFloat16(0.0)
         return scores + vf.load().to(cutlass.Float32)
 
     @cute.jit
@@ -58,7 +60,7 @@ def _make_mods(W, S, H):
     return score_mod, score_mod_bwd
 
 
-PAD_L, PAD_R = 136, 64
+PAD_L, PAD_R = 136, 320
 
 
 def _coeffs(S, H, W, Wp, device, padded):
@@ -70,7 +72,8 @@ def _coeffs(S, H, W, Wp, device, padded):
     )
 
 
-def _setup(S=1024, W=256, B=1, H=8, HKV=2, D=128, seed=0):
+def _setup(S=1024, W=256, B=1, H=8, HKV=2, D=128, seed=0,
+           full_attention=False):
     torch.manual_seed(seed)
     dev = "cuda"
     q = torch.randn(B, S, H, D, device=dev, dtype=torch.bfloat16)
@@ -78,7 +81,12 @@ def _setup(S=1024, W=256, B=1, H=8, HKV=2, D=128, seed=0):
     v = torch.randn(B, S, HKV, D, device=dev, dtype=torch.bfloat16)
     rel = 0.5 * torch.randn(B, S, H, W, device=dev, dtype=torch.bfloat16)
     dout = torch.randn(B, S, H, D, device=dev, dtype=torch.bfloat16)
-    kw = dict(softmax_scale=1.0 / D, window_size_left=W - 1, window_size_right=0)
+    kw = (
+        dict(softmax_scale=1.0 / D, causal=True)
+        if full_attention
+        else dict(softmax_scale=1.0 / D, window_size_left=W - 1,
+                  window_size_right=0)
+    )
     sm, smb = _make_mods(W, S, H)
     out, lse = _flash_attn_fwd(
         q, k, v, pack_gqa=False, score_mod=sm, aux_tensors=[rel.view(-1)],
@@ -126,6 +134,26 @@ def test_structural_matches_callbacks():
     N = B * S * H * W
     torch.testing.assert_close(
         dbias_b[:N].float(), dbias_ref[:N], rtol=1e-2, atol=1e-2
+    )
+
+
+def test_structural_full_attention_zeros_distances_beyond_bias_support():
+    values = _setup(S=2048, W=1024, H=2, HKV=2, full_attention=True)
+    q, k, v, rel, dout, out, lse, kw, sm, smb = values
+    B, S, H, W = rel.shape
+    dbias_ref = torch.zeros(B * S * H * W + 1, device=rel.device,
+                            dtype=torch.float32)
+    reference = _flash_attn_bwd(
+        q, k, v, out, dout, lse, score_mod=sm, score_mod_bwd=smb,
+        aux_tensors=[rel.view(-1), dbias_ref], **kw
+    )
+    structural = _run_structural(q, k, v, rel, dout, out, lse, kw)
+
+    for actual, expected in zip(structural[:3], reference, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    N = B * S * H * W
+    torch.testing.assert_close(
+        structural[3][:N].float(), dbias_ref[:N], rtol=1e-2, atol=1e-2
     )
 
 
