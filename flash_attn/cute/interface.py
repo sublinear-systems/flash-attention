@@ -232,6 +232,16 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
 
 
 
+# Trailing scratch elements a flat `dbias` tensor must carry: the SM90 backward
+# diverts out-of-support lanes into this tail region branchlessly, striped per
+# CTA so no cache line is shared by many concurrent tiles.
+DBIAS_TAIL_PAD = 4096
+# This wheel masks structural rel_bias values outside the logical support encoded
+# by rel_bias_coeffs[5:9]. Callers can therefore keep only the fixed staging guard
+# instead of materializing zeros out to the full causal distance.
+REL_BIAS_SUPPORT_MASKED = True
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -1297,6 +1307,10 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    dbias: Optional[torch.Tensor] = None,
+    dbias_coeffs=None,
+    rel_bias: Optional[torch.Tensor] = None,
+    rel_bias_coeffs=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -1471,7 +1485,11 @@ def _flash_attn_bwd(
         score_mod = utils.create_softcap_scoremod(softcap)
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
     if score_mod is not None:
-        assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
+        # With a dbias sink the joint graph is implicitly identity (additive bias):
+        # dS w.r.t. the pre-mod score equals dS, so no score_mod_bwd is needed.
+        assert score_mod_bwd is not None or dbias is not None, (
+            "score_mod_bwd is required when score_mod is provided (unless dbias is used)"
+        )
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
@@ -1612,6 +1630,71 @@ def _flash_attn_bwd(
     if aux_tensors is not None:
         cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
+    # Additive-bias gradient sink: the converted dS fragment is stored straight
+    # from registers to `dbias`. dbias is FLAT with DBIAS_TAIL_PAD trailing
+    # scratch elements the caller ignores (out-of-support lanes are diverted
+    # there); dbias_coeffs = 9 ints (affine flat index + validity window), see
+    # FlashAttentionBackwardSm90.flush_dbias.
+    dbias_params = None
+    if dbias is not None:
+        assert arch // 10 == 9, "dbias flush is only implemented in the SM90 backward"
+        assert cu_seqlens_q is None and cu_seqlens_k is None, "dbias: varlen unsupported"
+        assert block_sparse_tensors is None, "dbias: block sparsity unsupported"
+        assert dbias.dim() == 1 and dbias.is_contiguous(), "dbias must be flat contiguous"
+        assert dbias.dtype == q.dtype, "dbias dtype must match the input dtype"
+        assert dbias_coeffs is not None, "dbias requires dbias_coeffs"
+        if isinstance(dbias_coeffs, torch.Tensor):
+            dbias_params = dbias_coeffs
+        else:
+            dbias_params = torch.tensor(
+                list(dbias_coeffs), dtype=torch.int32, device=q.device
+            )
+        assert dbias_params.numel() == 9 and dbias_params.dtype == torch.int32
+        assert dbias_params.is_cuda
+    cute_dbias = (
+        to_cute_tensor(dbias, assumed_align=None, fully_dynamic=True)
+        if dbias is not None
+        else None
+    )
+    cute_dbias_params = (
+        to_cute_tensor(dbias_params, assumed_align=None, fully_dynamic=True)
+        if dbias_params is not None
+        else None
+    )
+
+    # Additive bias in relative (distance) layout, staged through smem by the SM90
+    # backward. rel_bias is FLAT, caller-padded (see load_rel_bias); rel_bias_coeffs
+    # uses the same 9-int convention as dbias_coeffs and must have kv coefficient -1.
+    rel_bias_params = None
+    if rel_bias is not None:
+        assert arch // 10 == 9, "rel_bias staging is only implemented in the SM90 backward"
+        assert score_mod is None and score_mod_bwd is None, (
+            "rel_bias replaces score_mod in the backward"
+        )
+        assert cu_seqlens_q is None and cu_seqlens_k is None, "rel_bias: varlen unsupported"
+        assert block_sparse_tensors is None, "rel_bias: block sparsity unsupported"
+        assert rel_bias.dim() == 1 and rel_bias.is_contiguous(), "rel_bias must be flat"
+        assert rel_bias.dtype == q.dtype, "rel_bias dtype must match the input dtype"
+        assert rel_bias_coeffs is not None, "rel_bias requires rel_bias_coeffs"
+        if isinstance(rel_bias_coeffs, torch.Tensor):
+            rel_bias_params = rel_bias_coeffs
+        else:
+            rel_bias_params = torch.tensor(
+                list(rel_bias_coeffs), dtype=torch.int32, device=q.device
+            )
+        assert rel_bias_params.numel() == 9 and rel_bias_params.dtype == torch.int32
+        assert rel_bias_params.is_cuda
+    cute_rel_bias = (
+        to_cute_tensor(rel_bias, assumed_align=None, fully_dynamic=True)
+        if rel_bias is not None
+        else None
+    )
+    cute_rel_bias_params = (
+        to_cute_tensor(rel_bias_params, assumed_align=None, fully_dynamic=True)
+        if rel_bias_params is not None
+        else None
+    )
+
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
     if block_sparse_tensors is not None:
@@ -1694,6 +1777,8 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            dbias is not None,
+            rel_bias is not None,
         )
     else:
         compile_key = (
@@ -1730,6 +1815,8 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            dbias is not None,
+            rel_bias is not None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1803,6 +1890,8 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
                 dQ_single_wg=dQ_single_wg,
+                has_dbias=dbias is not None,
+                has_rel_bias=rel_bias is not None,
             )
         else:
             if use_dedicated_hd256_kernel:
@@ -1885,6 +1974,10 @@ def _flash_attn_bwd(
             dK_semaphore_tensor,
             dV_semaphore_tensor,
             cute_aux_tensors,
+            cute_dbias,
+            cute_dbias_params,
+            cute_rel_bias,
+            cute_rel_bias_params,
             sparse_tensors_compile,
             current_stream,
             options="--enable-tvm-ffi",
@@ -1912,6 +2005,10 @@ def _flash_attn_bwd(
             dK_semaphore,
             dV_semaphore,
             aux_tensors,
+            dbias,
+            dbias_params,
+            rel_bias,
+            rel_bias_params,
             (
                 normalized_block_sparse_tensors.mask_block_cnt,
                 normalized_block_sparse_tensors.mask_block_idx,
