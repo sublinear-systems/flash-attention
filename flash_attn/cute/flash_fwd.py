@@ -186,8 +186,10 @@ class FlashAttentionForwardBase:
         mSeqUsedK_type: Type[cutlass.Numeric] | None,
     ):
         # Get the data type and check if it is fp16 or bf16
-        if const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
-            raise TypeError("All tensors must have the same data type")
+        if const_expr(not (mQ_type == mK_type == mV_type)):
+            raise TypeError("Q/K/V must have the same data type")
+        if const_expr(mO_type not in (mQ_type, Float32)):
+            raise TypeError("Output must use the input dtype or Float32")
         if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
         if const_expr(mLSE_type not in [None, Float32]):
@@ -327,6 +329,35 @@ class FlashAttentionForwardBase:
         raise NotImplementedError()
 
     @cute.jit
+    def store_output_fp32(
+        self,
+        acc_O: cute.Tensor,
+        mO: cute.Tensor,
+        seqlen: SeqlenInfoQK,
+        tiled_mma: cute.TiledMma,
+        tidx: Int32,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+    ):
+        # Store the normalized accumulator before half-precision rounding. The
+        # output is un-packed even when queries are packed for the MMA.
+        thr_mma = tiled_mma.get_slice(tidx)
+        cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
+        coords = thr_mma.partition_C(cO)
+        output = seqlen.offset_batch_Q(mO, batch_idx, dim=3)
+        for i in cutlass.range(cute.size(acc_O), unroll_full=True):
+            row, column = coords[i]
+            row += m_block * self.tile_m
+            if const_expr(self.pack_gqa):
+                q_head = head_idx * self.qhead_per_kvhead + row % self.qhead_per_kvhead
+                row //= self.qhead_per_kvhead
+            else:
+                q_head = head_idx
+            if row < seqlen.seqlen_q and column < mO.shape[1]:
+                output[row, column, q_head] = acc_O[i]
+
+    @cute.jit
     def epilogue(
         self,
         acc_O: cute.Tensor,
@@ -343,20 +374,25 @@ class FlashAttentionForwardBase:
         head_idx: Int32,
         batch_idx: Int32,
     ):
-        # store acc_O
-        rO = cute.make_fragment_like(acc_O, self.dtype)
-        rO.store(acc_O.load().to(self.dtype))
-        # Make sure all threads have finished reading V
-        cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
-        )
-        smem_copy_atom_O = utils.get_smem_store_atom(self.arch.major * 10 + self.arch.minor, self.dtype)
-        smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
-        taccOrO = smem_thr_copy_O.retile(rO)
-        taccOsO = smem_thr_copy_O.partition_D(sO)
-        # taccOsO = copy_utils.partition_D_position_independent(smem_thr_copy_O, sO)
-        # copy acc O from rmem to smem with the smem copy atom
-        cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
+        if const_expr(mO.element_type == Float32):
+            self.store_output_fp32(
+                acc_O, mO, seqlen, tiled_mma, tidx, m_block, head_idx, batch_idx
+            )
+        else:
+            # store acc_O
+            rO = cute.make_fragment_like(acc_O, self.dtype)
+            rO.store(acc_O.load().to(self.dtype))
+            # Make sure all threads have finished reading V
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
+            )
+            smem_copy_atom_O = utils.get_smem_store_atom(self.arch.major * 10 + self.arch.minor, self.dtype)
+            smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
+            taccOrO = smem_thr_copy_O.retile(rO)
+            taccOsO = smem_thr_copy_O.partition_D(sO)
+            # taccOsO = copy_utils.partition_D_position_independent(smem_thr_copy_O, sO)
+            # copy acc O from rmem to smem with the smem copy atom
+            cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
 
         cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
         pack_gqa = PackGQA(
@@ -387,6 +423,9 @@ class FlashAttentionForwardBase:
                             taccOgLSE[m, 0] = lse[m]
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
+
+        if const_expr(mO.element_type == Float32):
+            return
 
         ragged = self.use_tma_O and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
         mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]

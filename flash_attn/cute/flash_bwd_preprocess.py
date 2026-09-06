@@ -84,7 +84,7 @@ class FlashAttentionBackwardPreprocess:
         :return: True if the kernel can be implemented, False otherwise
         :rtype: bool
         """
-        if dtype not in [cutlass.Float16, cutlass.BFloat16]:
+        if dtype not in [cutlass.Float16, cutlass.BFloat16, Float32]:
             return False
         if head_dim % 8 != 0:
             return False
@@ -140,11 +140,11 @@ class FlashAttentionBackwardPreprocess:
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # Get the data type and check if it is fp16 or bf16
-        if const_expr(not (mO.element_type == mdO.element_type)):
-            raise TypeError("All tensors must have the same data type")
-        if const_expr(mO.element_type not in [cutlass.Float16, cutlass.BFloat16]):
-            raise TypeError("Only Float16 or BFloat16 is supported")
+        # O may preserve the FP32 accumulator while dO stays in the input dtype.
+        if const_expr(mO.element_type not in (mdO.element_type, Float32)):
+            raise TypeError("Output must use the gradient dtype or Float32")
+        if const_expr(mdO.element_type not in [cutlass.Float16, cutlass.BFloat16]):
+            raise TypeError("Output gradient must use Float16 or BFloat16")
         if const_expr(mPdPsum.element_type not in [Float32]):
             raise TypeError("PdPsum tensor must be Float32")
         if const_expr(mdQaccum is not None):
@@ -296,6 +296,9 @@ class FlashAttentionBackwardPreprocess:
             tOpO = None
             if const_expr(self.check_hdim_v_oob):
                 tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
+                # The predicate broadcasts over rows; each copy below loads
+                # just one row. FP32 O can give a thread multiple such rows.
+                tOpO = tOpO[None, 0, None]
             # Each copy will use the same predicate
             copy = partial(copy_utils.copy, pred=tOpO)
 
