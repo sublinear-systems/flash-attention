@@ -458,11 +458,6 @@ def _flash_attn_fwd(
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
-    if not is_fp8 and out is not None and out.dtype == torch.float32:
-        assert arch // 10 == 9, "FP32 output is currently supported on SM90"
-        # Preserve the normalized accumulator for callers that need an accurate
-        # (O * dO).sum() in backward. The default output dtype is unchanged.
-        out_torch_dtype = torch.float32
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
 
@@ -712,7 +707,6 @@ def _flash_attn_fwd(
 
     compile_key = (
         dtype,
-        out_torch_dtype,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -1159,27 +1153,26 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
 
 
 def _compile_bwd_preprocess(
-    dtype, out_dtype, head_dim, head_dim_v, m_block_size, has_cuseqlens_q, has_seqused_q, has_dlse, has_dq_accum,
-    use_padded_offsets, hdim_multiple_of,
+    dtype, head_dim, head_dim_v, m_block_size, has_cuseqlens_q, has_seqused_q, has_dlse, has_dq_accum,
+    use_padded_offsets, hdim_multiple_of, has_delta,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
         dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
     )
-    if out_dtype != dtype:
-        mO = fake_tensor(out_dtype, mO.shape, divisibility=128 // out_dtype.width)
     batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
     batchp1 = cute.sym_int()
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
+    mDelta = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_delta else None
     mdQaccum = mdQaccum if has_dq_accum else None
     fa_bwd_pre = FlashAttentionBackwardPreprocess(
-        out_dtype, head_dim, head_dim_v, m_block_size, use_padded_offsets=use_padded_offsets,
+        dtype, head_dim, head_dim_v, m_block_size, use_padded_offsets=use_padded_offsets,
         hdim_multiple_of=hdim_multiple_of,
     )
     return cute.compile(
-        fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
+        fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE, mDelta,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1191,21 +1184,24 @@ def _bwd_preprocess(
     dtype, head_dim, head_dim_v, m_block_size,
     use_padded_offsets=True,
     hdim_multiple_of=32,
+    delta=None,
 ):
-    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
+    """Compute D - dLSE, lse * log2_e, and zero out dq_accum.
+
+    D is ``delta`` when provided, otherwise ``(out * dout).sum(dim=-1)``.
 
     ``hdim_multiple_of`` must match the bwd kernel's ``tile_hdim`` alignment
     so the zero-fill covers the full buffer."""
     is_varlen = cu_seqlens_q is not None
     compile_key = (
-        dtype, torch2cute_dtype_map[out.dtype], head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None, dq_accum is not None,
-        use_padded_offsets, hdim_multiple_of,
+        dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None, dq_accum is not None,
+        use_padded_offsets, hdim_multiple_of, delta is not None,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not is_fake_mode():
         _bwd_preprocess.compile_cache[compile_key](
-            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
+            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse, delta
         )
 
 
@@ -1268,7 +1264,7 @@ def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
+    out: Optional[torch.Tensor],
     dout: torch.Tensor,
     lse: torch.Tensor,
     softmax_scale: Optional[float] = None,
@@ -1305,7 +1301,20 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    delta: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute attention gradients, optionally using a precomputed softmax reduction.
+
+    ``delta`` is D_i = sum_j P_ij * dot(dout_i, V_j), before subtracting
+    ``dlse``. It must be float32 with the same shape as ``lse``, and must
+    reflect the forward pass's masking and score modifications. Supplying it
+    avoids deriving D from the rounded output and permits ``out=None``.
+    """
+    if out is None:
+        assert delta is not None, "out is required unless delta is provided"
+        # Preprocessing still uses the output's shape/layout metadata. With
+        # delta supplied it does not read out or dout, so reuse dout's metadata.
+        out = dout
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     sparse_q = None
@@ -1447,16 +1456,18 @@ def _flash_attn_bwd(
         )
 
     assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype == dout.dtype, (
+    assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype, (
         "inputs must have the same dtype"
     )
-    assert out.dtype in (q.dtype, torch.float32)
     for t in [cu_seqlens_q, cu_seqlens_k]:
         if t is not None:
             assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k must be int32"
     assert lse.dtype == torch.float32, "lse must be float32"
     if dlse is not None:
         dlse = maybe_contiguous(dlse)
+    if delta is not None:
+        delta = maybe_contiguous(delta)
+        _validate_tensor(delta, "delta", lse.shape, torch.float32, q.device)
     if not is_fake_mode():
         assert all(
             t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
@@ -1606,6 +1617,7 @@ def _flash_attn_bwd(
         dtype, head_dim, head_dim_v, m_block_size,
         use_padded_offsets=use_dedicated_hd256_kernel,
         hdim_multiple_of=_bwd_hdim_mul,
+        delta=delta,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).

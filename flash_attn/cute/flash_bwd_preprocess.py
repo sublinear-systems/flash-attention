@@ -4,6 +4,7 @@
 #
 # Computes D_i = (dO_i * O_i).sum(dim=-1), optionally adjusted for LSE gradient:
 #   D'_i = D_i - dLSE_i
+# A caller-supplied D_i can replace the reduction over O_i and dO_i.
 # This works because in the backward pass:
 #   dS_ij = P_ij * (dP_ij - D_i)                     [standard]
 # When LSE is differentiable, d(loss)/d(S_ij) gets an extra term dLSE_i * P_ij
@@ -84,7 +85,7 @@ class FlashAttentionBackwardPreprocess:
         :return: True if the kernel can be implemented, False otherwise
         :rtype: bool
         """
-        if dtype not in [cutlass.Float16, cutlass.BFloat16, Float32]:
+        if dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
         if head_dim % 8 != 0:
             return False
@@ -137,14 +138,15 @@ class FlashAttentionBackwardPreprocess:
         mCuSeqlensQ: Optional[cute.Tensor],  # (batch + 1,)
         mSeqUsedQ: Optional[cute.Tensor],  # (batch,)
         mdLSE: Optional[cute.Tensor],  # (batch, nheads, seqlen) or (nheads, total_q)
+        mDelta: Optional[cute.Tensor],  # same shape as mdLSE; unadjusted D_i
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # O may preserve the FP32 accumulator while dO stays in the input dtype.
-        if const_expr(mO.element_type not in (mdO.element_type, Float32)):
-            raise TypeError("Output must use the gradient dtype or Float32")
-        if const_expr(mdO.element_type not in [cutlass.Float16, cutlass.BFloat16]):
-            raise TypeError("Output gradient must use Float16 or BFloat16")
+        # Get the data type and check if it is fp16 or bf16
+        if const_expr(not (mO.element_type == mdO.element_type)):
+            raise TypeError("All tensors must have the same data type")
+        if const_expr(mO.element_type not in [cutlass.Float16, cutlass.BFloat16]):
+            raise TypeError("Only Float16 or BFloat16 is supported")
         if const_expr(mPdPsum.element_type not in [Float32]):
             raise TypeError("PdPsum tensor must be Float32")
         if const_expr(mdQaccum is not None):
@@ -159,6 +161,9 @@ class FlashAttentionBackwardPreprocess:
         if const_expr(mdLSE is not None):
             if const_expr(mdLSE.element_type not in [Float32]):
                 raise TypeError("dLSE tensor must be Float32")
+        if const_expr(mDelta is not None):
+            if const_expr(mDelta.element_type not in [Float32]):
+                raise TypeError("Delta tensor must be Float32")
 
         self._setup_attributes()
 
@@ -170,6 +175,8 @@ class FlashAttentionBackwardPreprocess:
             mLSElog2 = layout_utils.select(mLSElog2, transpose)
         if const_expr(mdLSE is not None):
             mdLSE = layout_utils.select(mdLSE, transpose)
+        if const_expr(mDelta is not None):
+            mDelta = layout_utils.select(mDelta, transpose)
         if const_expr(mdQaccum is not None):
             mdQaccum = layout_utils.select(mdQaccum, transpose)
 
@@ -209,6 +216,7 @@ class FlashAttentionBackwardPreprocess:
             mCuSeqlensQ,
             mSeqUsedQ,
             mdLSE,
+            mDelta,
             self.gmem_tiled_copy_O,
             self.gmem_tiled_copy_dQaccum,
             tile_sched_params,
@@ -232,6 +240,7 @@ class FlashAttentionBackwardPreprocess:
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mdLSE: Optional[cute.Tensor],
+        mDelta: Optional[cute.Tensor],
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_dQaccum: cute.TiledCopy,
         tile_sched_params: ParamsBase,
@@ -283,69 +292,84 @@ class FlashAttentionBackwardPreprocess:
                 if tidx < seqlen_limit:
                     lse = gLSE[tidx]
 
-            blk_shape = (self.tile_m, self.head_dim_v_padded)
-            gO = cute.local_tile(mO_cur, blk_shape, (m_block, 0))
-            gdO = cute.local_tile(mdO_cur, blk_shape, (m_block, 0))
-            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-            # (CPY_Atom, CPY_M, CPY_K)
-            tOgO = gmem_thr_copy_O.partition_S(gO)
-            tOgdO = gmem_thr_copy_O.partition_S(gdO)
-            cO = cute.make_identity_tensor(blk_shape)
-            tOcO = gmem_thr_copy_O.partition_S(cO)
-            t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
-            tOpO = None
-            if const_expr(self.check_hdim_v_oob):
-                tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
-                # The predicate broadcasts over rows; each copy below loads
-                # just one row. FP32 O can give a thread multiple such rows.
-                tOpO = tOpO[None, 0, None]
-            # Each copy will use the same predicate
-            copy = partial(copy_utils.copy, pred=tOpO)
+            if const_expr(mDelta is not None):
+                mDelta_cur = seqlen.offset_batch(mDelta, batch_idx, dim=2)[None, head_idx]
+                gDelta = cute.local_tile(mDelta_cur, (self.tile_m,), (m_block,))
+                value = Float32(0.0)
+                if tidx < self.tile_m and tidx < seqlen_limit:
+                    value = gDelta[tidx]
+                    if const_expr(mdLSE is not None):
+                        mdLSE_cur = seqlen.offset_batch(mdLSE, batch_idx, dim=2)[None, head_idx]
+                        gdLSE = cute.local_tile(mdLSE_cur, (self.tile_m,), (m_block,))
+                        value -= gdLSE[tidx]
+                # All upstream loads are complete. The backward kernel waits
+                # for this kernel's stores before consuming D and log2(LSE).
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_launch_dependents()
+                if tidx < self.tile_m:
+                    gPdPsum = cute.local_tile(mPdPsum_cur, (self.tile_m,), (m_block,))
+                    gPdPsum[tidx] = value
+            else:
+                blk_shape = (self.tile_m, self.head_dim_v_padded)
+                gO = cute.local_tile(mO_cur, blk_shape, (m_block, 0))
+                gdO = cute.local_tile(mdO_cur, blk_shape, (m_block, 0))
+                gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+                # (CPY_Atom, CPY_M, CPY_K)
+                tOgO = gmem_thr_copy_O.partition_S(gO)
+                tOgdO = gmem_thr_copy_O.partition_S(gdO)
+                cO = cute.make_identity_tensor(blk_shape)
+                tOcO = gmem_thr_copy_O.partition_S(cO)
+                t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
+                tOpO = None
+                if const_expr(self.check_hdim_v_oob):
+                    tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
+                # Each copy will use the same predicate
+                copy = partial(copy_utils.copy, pred=tOpO)
 
-            tOrO = cute.make_rmem_tensor_like(tOgO)
-            tOrdO = cute.make_rmem_tensor_like(tOgdO)
-            if const_expr(self.check_hdim_v_oob):
-                tOrO.fill(0.0)
-                tOrdO.fill(0.0)
-            assert tOgO.shape == tOgdO.shape
-            for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
-                # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
-                # This is bc the entries of t0OcO are known at compile time.
-                if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
-                    copy(tOgO[None, m, None], tOrO[None, m, None])
-                    copy(tOgdO[None, m, None], tOrdO[None, m, None])
-            # O and dO loads are done; signal that the next kernel can start.
-            # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
-            if const_expr(self.use_pdl):
-                cute.arch.griddepcontrol_launch_dependents()
-            # Sum across the "k" dimension
-            pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
-                cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
-            )
-            threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
-            assert cute.arch.WARP_SIZE % threads_per_row == 0
-            pdpsum = utils.warp_reduce(pdpsum, operator.add, width=threads_per_row)
-            PdP_sum = cute.make_rmem_tensor(cute.size(tOrO, mode=[1]), Float32)
-            PdP_sum.store(pdpsum)
+                tOrO = cute.make_rmem_tensor_like(tOgO)
+                tOrdO = cute.make_rmem_tensor_like(tOgdO)
+                if const_expr(self.check_hdim_v_oob):
+                    tOrO.fill(0.0)
+                    tOrdO.fill(0.0)
+                assert tOgO.shape == tOgdO.shape
+                for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
+                    # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
+                    # This is bc the entries of t0OcO are known at compile time.
+                    if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
+                        copy(tOgO[None, m, None], tOrO[None, m, None])
+                        copy(tOgdO[None, m, None], tOrdO[None, m, None])
+                # O and dO loads are done; signal that the next kernel can start.
+                # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_launch_dependents()
+                # Sum across the "k" dimension
+                pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
+                    cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
+                )
+                threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
+                assert cute.arch.WARP_SIZE % threads_per_row == 0
+                pdpsum = utils.warp_reduce(pdpsum, operator.add, width=threads_per_row)
+                PdP_sum = cute.make_rmem_tensor(cute.size(tOrO, mode=[1]), Float32)
+                PdP_sum.store(pdpsum)
 
-            # If dLSE is provided, compute D' = D - dLSE (see module docstring for derivation).
-            gdLSE = None
-            if const_expr(mdLSE is not None):
-                mdLSE_cur = seqlen.offset_batch(mdLSE, batch_idx, dim=2)[None, head_idx]
-                gdLSE = cute.local_tile(mdLSE_cur, (self.tile_m,), (m_block,))
+                # If dLSE is provided, compute D' = D - dLSE (see module docstring for derivation).
+                gdLSE = None
+                if const_expr(mdLSE is not None):
+                    mdLSE_cur = seqlen.offset_batch(mdLSE, batch_idx, dim=2)[None, head_idx]
+                    gdLSE = cute.local_tile(mdLSE_cur, (self.tile_m,), (m_block,))
 
-            # Write PdPsum from rmem -> gmem
-            gPdPsum = cute.local_tile(mPdPsum_cur, (self.tile_m,), (m_block,))
-            # Only the thread corresponding to column 0 writes out the PdPsum to gmem
-            if tOcO[0, 0, 0][1] == 0:
-                for m in cutlass.range(cute.size(PdP_sum), unroll_full=True):
-                    row = tOcO[0, m, 0][0]
-                    PdPsum_val = 0.0
-                    if row < seqlen_limit:
-                        PdPsum_val = PdP_sum[m]
-                        if const_expr(mdLSE is not None):
-                            PdPsum_val -= gdLSE[row]
-                    gPdPsum[row] = PdPsum_val
+                # Write PdPsum from rmem -> gmem
+                gPdPsum = cute.local_tile(mPdPsum_cur, (self.tile_m,), (m_block,))
+                # Only the thread corresponding to column 0 writes out the PdPsum to gmem
+                if tOcO[0, 0, 0][1] == 0:
+                    for m in cutlass.range(cute.size(PdP_sum), unroll_full=True):
+                        row = tOcO[0, m, 0][0]
+                        PdPsum_val = 0.0
+                        if row < seqlen_limit:
+                            PdPsum_val = PdP_sum[m]
+                            if const_expr(mdLSE is not None):
+                                PdPsum_val -= gdLSE[row]
+                        gPdPsum[row] = PdPsum_val
 
             # Clear dQaccum
             if const_expr(mdQaccum is not None):

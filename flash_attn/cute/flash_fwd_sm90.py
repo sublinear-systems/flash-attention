@@ -224,22 +224,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
-        self.use_tma_O = self.use_tma_Q and mO.element_type != Float32
+        self.use_tma_O = self.use_tma_Q
         # Producer needs more registers when doing cp.async Q or KV loads
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
-        # FP32 output is stored directly from registers; it does not need a
-        # larger shared-memory buffer. The usual half-output path is unchanged.
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
             sm90_utils.make_smem_layout(mX.element_type, LayoutEnum.ROW_MAJOR, shape, stage)
             for mX, shape, stage in [
                 (mQ, (self.tile_m, self.tile_hdim), None),
                 (mK, (self.tile_n, self.tile_hdim), self.num_stages),
                 (mV, (self.tile_n, self.tile_hdimv), self.num_stages),
-                (mV, (self.tile_m, self.tile_hdimv), None),
+                (mO, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
         self.sP_layout = None
@@ -355,16 +353,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable
         )
 
-        mO_kernel = (
-            tma_tensor_O if const_expr(self.use_tma_O)
-            else mO_og if const_expr(mO.element_type == Float32)
-            else mO
-        )
         self.kernel(
             tma_tensor_Q if const_expr(self.use_tma_Q) else mQ,
             tma_tensor_K if const_expr(self.use_tma_KV) else mK,
             tma_tensor_V if const_expr(self.use_tma_KV) else mV,
-            mO_kernel,
+            tma_tensor_O if const_expr(self.use_tma_O) else mO,
             mLSE,
             mCuSeqlensQ,
             mCuSeqlensK,
